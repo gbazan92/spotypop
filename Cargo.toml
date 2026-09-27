@@ -1,0 +1,15 @@
+[package]
+name = "cosmic-ext-applet-hola"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+# libcosmic has no stable releases and its API changes often; bump deliberately.
+rev = "1f6dc991eaa5115a09be2505cc8a323e5b2b0bff"
+default-features = false
+features = ["applet", "wayland", "tokio"]
+
+[profile.release]
+lto = "thin"
