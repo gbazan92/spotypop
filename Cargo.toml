@@ -5,8 +5,8 @@ members = ["player"]
 name = "spotypop"
 version = "0.1.0"
 edition = "2024"
-license = "GPL-3.0"
-description = "A Spotify mini player for the COSMIC panel"
+license = "GPL-3.0-only"
+description = "A Spotify mini player for the COSMIC desktop panel"
 repository = "https://github.com/gbazan92/spotypop"
 
 [dependencies]

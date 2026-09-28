@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=SpotyPop
-Comment=A Spotify mini player for the COSMIC panel
+Comment=A Spotify mini player for the COSMIC™ desktop panel
 Exec=spotypop
 Terminal=false
 Type=Application

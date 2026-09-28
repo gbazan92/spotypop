@@ -32,6 +32,7 @@ modules:
       - install -Dm0644 res/io.github.gbazan92.SpotyPop.metainfo.xml /app/share/metainfo/io.github.gbazan92.SpotyPop.metainfo.xml
       - install -Dm0644 res/icons/hicolor/scalable/apps/io.github.gbazan92.SpotyPop.svg /app/share/icons/hicolor/scalable/apps/io.github.gbazan92.SpotyPop.svg
       - install -Dm0644 res/icons/hicolor/scalable/apps/io.github.gbazan92.SpotyPop-symbolic.svg /app/share/icons/hicolor/scalable/apps/io.github.gbazan92.SpotyPop-symbolic.svg
+      - install -Dm0644 -t /app/share/licenses/io.github.gbazan92.SpotyPop LICENSE THIRD-PARTY-NOTICES.md
     sources:
       # For the COSMIC Flatpak repository this becomes the git URL and release tag.
       - type: dir

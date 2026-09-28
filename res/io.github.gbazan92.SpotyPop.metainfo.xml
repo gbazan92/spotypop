@@ -2,7 +2,7 @@
 <component type="desktop-application">
   <id>io.github.gbazan92.SpotyPop</id>
   <name>SpotyPop</name>
-  <summary>A Spotify mini player for the COSMIC panel</summary>
+  <summary>A Spotify mini player for the COSMIC™ desktop panel</summary>
   <developer id="io.github.gbazan92">
     <name>Gerardo Bazán</name>
   </developer>
@@ -10,14 +10,19 @@
   <project_license>GPL-3.0-only</project_license>
   <description>
     <p>
-      SpotyPop puts Spotify in the COSMIC panel: the current song with its cover
-      or a live audio scope, and a popup to control playback, search, browse your
-      playlists and podcasts, and manage the queue.
+      SpotyPop puts Spotify in the panel of the COSMIC™ desktop: the current song
+      with its cover or a live audio scope, and a popup to control playback,
+      search, browse your playlists and podcasts, and manage the queue.
     </p>
     <p>
       It can also turn this computer into a Spotify Connect device, so music plays
       without the Spotify app open. Requires Spotify Premium and a free Spotify
       developer app for its Client ID.
+    </p>
+    <p>
+      SpotyPop is an adaptation of omarchy-spotify by Ninepoint Labs and
+      Omarchy-Spotify by Kristoffer Haugland, both MIT licensed. It is an
+      independent project, not affiliated with or endorsed by Spotify or System76.
     </p>
   </description>
   <launchable type="desktop-id">io.github.gbazan92.SpotyPop.desktop</launchable>
