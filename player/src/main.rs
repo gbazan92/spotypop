@@ -180,7 +180,9 @@ async fn login(port: u16) -> Result<(), Failure> {
         &format!("http://127.0.0.1:{port}/login"),
         OAUTH_SCOPES.to_vec(),
     )
-    .with_custom_message(login_done_page())
+    .with_custom_message(
+        "<h2>Done, this computer can now play Spotify.</h2><p>You can close this tab.</p>",
+    )
     .open_in_browser()
     .build()
     .map_err(|error| Failure::Other(format!("oauth client: {error}")))?;
@@ -200,19 +202,6 @@ async fn login(port: u16) -> Result<(), Failure> {
     session.shutdown();
     println!("playback authorized");
     Ok(())
-}
-
-/// The receiver has no translation catalog; this one page follows the locale.
-fn login_done_page() -> &'static str {
-    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
-        .into_iter()
-        .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()))
-        .unwrap_or_default();
-    if locale.starts_with("es") {
-        "<h2>Listo, esta computadora ya puede reproducir Spotify.</h2><p>Podés cerrar esta pestaña.</p>"
-    } else {
-        "<h2>Done, this computer can now play Spotify.</h2><p>You can close this tab.</p>"
-    }
 }
 
 /// Held for the life of the receiver so a second `run` exits at once.

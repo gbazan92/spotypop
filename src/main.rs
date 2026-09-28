@@ -14,6 +14,5 @@ mod window;
 fn main() -> cosmic::iced::Result {
     // reqwest is built without a bundled crypto provider; ring only needs a C compiler.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    i18n::init();
     cosmic::applet::run::<window::Window>(())
 }

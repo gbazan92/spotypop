@@ -8,9 +8,6 @@ A Spotify mini player for the [COSMIC](https://system76.com/cosmic) panel.
 - Pick which Spotify Connect device plays.
 - Optionally turns this computer into a Spotify Connect device, so music plays
   without the Spotify app open.
-
-The interface is in English and Spanish, following the desktop language.
-
 ## Requirements
 
 - COSMIC desktop
@@ -44,7 +41,7 @@ just test
 just dev     # install and restart the applet
 ```
 
-Translations live in `i18n/<language>/spotypop.ftl` ([Fluent](https://projectfluent.org/)).
+User-facing text lives in `i18n/en/spotypop.ftl` ([Fluent](https://projectfluent.org/)).
 
 ## License
 

@@ -11,7 +11,7 @@ repository = "https://github.com/gbazan92/spotypop"
 
 [dependencies]
 base64 = "0.23.1"
-i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
+i18n-embed = { version = "0.16", features = ["fluent-system"] }
 i18n-embed-fl = "0.10"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2.189"
