@@ -1,5 +1,5 @@
 use cosmic::Element;
-use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
+use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, LineHeight, Wrapping};
 use cosmic::iced::{Alignment, Color, Length, Limits};
 use cosmic::theme;
 use cosmic::widget::{
@@ -135,11 +135,21 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         } else {
             format!("{}  ·  {}", item.name, item.subtitle)
         };
+        // The preset line height is taller than the icon (30px against a 28px
+        // icon on a medium panel), which is what stretches the bar.
         content = content.push(marquee(
-            applet.text(label).wrapping(Wrapping::None),
+            applet
+                .text(label)
+                .wrapping(Wrapping::None)
+                .line_height(LineHeight::Absolute(cover_size.into())),
             PANEL_LABEL_WIDTH,
         ));
     }
+
+    let content = container(content)
+        .height(cover_size)
+        .align_y(Alignment::Center)
+        .clip(true);
 
     let button = button::custom(content)
         .padding([pad_y, pad_x])
