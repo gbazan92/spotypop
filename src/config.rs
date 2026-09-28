@@ -1,8 +1,46 @@
 use cosmic::cosmic_config::{
     self, Config, CosmicConfigEntry, cosmic_config_derive::CosmicConfigEntry,
 };
+use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_REDIRECT_PORT: u16 = 8888;
+
+/// What the panel shows, besides the plain icon, while something is playing.
+/// Every variant stays inside the bar's height.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelLook {
+    #[default]
+    Cover,
+    Bars,
+    Wave,
+    Mirror,
+    Fill,
+}
+
+impl PanelLook {
+    pub const ALL: [Self; 5] = [
+        Self::Cover,
+        Self::Bars,
+        Self::Wave,
+        Self::Mirror,
+        Self::Fill,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cover => "Portada y título",
+            Self::Bars => "Barras",
+            Self::Wave => "Ondas",
+            Self::Mirror => "Espejo",
+            Self::Fill => "Relleno",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|look| *look == self).unwrap_or(0)
+    }
+}
 
 #[derive(Clone, CosmicConfigEntry, Debug, Eq, PartialEq)]
 #[version = 1]
@@ -12,6 +50,7 @@ pub struct AppConfig {
     /// Must match the redirect URI registered in that app.
     pub redirect_port: u16,
     pub show_track: bool,
+    pub panel_look: PanelLook,
 }
 
 impl Default for AppConfig {
@@ -20,6 +59,7 @@ impl Default for AppConfig {
             client_id: String::new(),
             redirect_port: DEFAULT_REDIRECT_PORT,
             show_track: true,
+            panel_look: PanelLook::Cover,
         }
     }
 }
@@ -55,5 +95,20 @@ fn is_real_error(error: &cosmic_config::Error) -> bool {
     match error {
         cosmic_config::Error::GetKey(_, io) => io.kind() != std::io::ErrorKind::NotFound,
         other => other.is_err(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_looks_have_distinct_labels() {
+        let mut labels: Vec<_> = PanelLook::ALL.iter().map(|look| look.label()).collect();
+        let count = labels.len();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), count);
+        assert_eq!(PanelLook::Cover.index(), 0);
     }
 }

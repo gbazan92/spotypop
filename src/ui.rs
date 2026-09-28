@@ -3,11 +3,13 @@ use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, LineHeight, 
 use cosmic::iced::{Alignment, Color, Length, Limits};
 use cosmic::theme;
 use cosmic::widget::{
-    Column, Row, button, container, divider, icon, image, mouse_area, scrollable,
+    Column, Row, button, container, divider, dropdown, icon, image, mouse_area, scrollable,
     segmented_control, settings, slider, space, text, text_input, toggler,
 };
 
 use crate::browse::{Browse, Load, Source, Tab};
+use crate::config::PanelLook;
+use crate::look::{self, scope};
 use crate::marquee::marquee;
 use crate::spotify::{Device, Entry, EntryKind, Item, ItemKind, Repeat, Session};
 use crate::window::{Message, Playback, View, Window};
@@ -124,27 +126,15 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         None => logo(icon_size).into(),
     };
 
-    let mut content = Row::new().spacing(8).align_y(Alignment::Center).push(cover);
-
-    if horizontal
-        && state.config.show_track
-        && let Some(item) = state.item()
-    {
-        let label = if item.subtitle.is_empty() {
-            item.name.clone()
-        } else {
-            format!("{}  ·  {}", item.name, item.subtitle)
-        };
-        // The preset line height is taller than the icon (30px against a 28px
-        // icon on a medium panel), which is what stretches the bar.
-        content = content.push(marquee(
-            applet
-                .text(label)
-                .wrapping(Wrapping::None)
-                .line_height(LineHeight::Absolute(cover_size.into())),
-            PANEL_LABEL_WIDTH,
-        ));
-    }
+    let content = if horizontal && state.config.show_track && state.item().is_some() {
+        playing_chip(state, cover_size, cover)
+    } else {
+        Row::new()
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .push(cover)
+            .into()
+    };
 
     let content = container(content)
         .height(cover_size)
@@ -162,6 +152,72 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         .on_scroll(Message::Scroll);
 
     applet.autosize_window(area).into()
+}
+
+/// Title line for the bar: song, then the artist after a dot.
+fn track_label(state: &Window) -> String {
+    let Some(item) = state.item() else {
+        return String::new();
+    };
+    if item.subtitle.is_empty() {
+        item.name.clone()
+    } else {
+        format!("{}  ·  {}", item.name, item.subtitle)
+    }
+}
+
+fn scrolling_label(state: &Window, cover_size: f32) -> Element<'_, Message> {
+    let applet = &state.core.applet;
+    // The preset line height is taller than the icon, which stretches the bar.
+    marquee(
+        applet
+            .text(track_label(state))
+            .wrapping(Wrapping::None)
+            .line_height(LineHeight::Absolute(cover_size.into())),
+        PANEL_LABEL_WIDTH,
+    )
+    .into()
+}
+
+fn playing_chip<'a>(
+    state: &'a Window,
+    cover_size: f32,
+    cover: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let playing = state.is_playing();
+    let trail = match state.config.panel_look {
+        PanelLook::Cover => scrolling_label(state, cover_size),
+        PanelLook::Bars => scope(
+            look::ScopeKind::Bars,
+            PANEL_LABEL_WIDTH,
+            cover_size,
+            playing,
+        ),
+        PanelLook::Wave => scope(
+            look::ScopeKind::Wave,
+            PANEL_LABEL_WIDTH,
+            cover_size,
+            playing,
+        ),
+        PanelLook::Mirror => scope(
+            look::ScopeKind::Mirror,
+            PANEL_LABEL_WIDTH,
+            cover_size,
+            playing,
+        ),
+        PanelLook::Fill => scope(
+            look::ScopeKind::Fill,
+            PANEL_LABEL_WIDTH,
+            cover_size,
+            playing,
+        ),
+    };
+    Row::new()
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .push(cover)
+        .push(trail)
+        .into()
 }
 
 // ---------------------------------------------------------------- popup
@@ -1095,10 +1151,23 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
         mask(&state.config.client_id)
     };
 
-    let panel = settings::section().title("Panel").add(settings::item(
+    let mut panel = settings::section().title("Panel").add(settings::item(
         "Mostrar título y artista",
         toggler(state.config.show_track).on_toggle(Message::SetShowTrack),
     ));
+    if state.config.show_track {
+        let labels: Vec<String> = PanelLook::ALL
+            .iter()
+            .map(|look| look.label().to_owned())
+            .collect();
+        panel = panel.add(settings::item(
+            "Estilo",
+            dropdown(labels, Some(state.config.panel_look.index()), |index| {
+                Message::SetPanelLook(PanelLook::ALL[index])
+            })
+            .width(Length::Fixed(168.0)),
+        ));
+    }
 
     let mut column = Column::new()
         .spacing(14)

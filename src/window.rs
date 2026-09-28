@@ -20,7 +20,7 @@ use cosmic::{Action, Element, Task};
 
 use crate::art::{self, Artwork};
 use crate::browse::{Browse, Library};
-use crate::config::{self, AppConfig};
+use crate::config::{self, AppConfig, PanelLook};
 use crate::spotify::{self, Item, PlayerState, Session, Spotify, Store, User};
 use crate::{browser, player, ui};
 
@@ -104,6 +104,7 @@ pub enum Message {
     CopyRedirectUri,
     CopiedReset,
     SetShowTrack(bool),
+    SetPanelLook(PanelLook),
     Poll,
     Tick,
     PlayerLoaded(Box<Result<Option<PlayerState>, spotify::Error>>),
@@ -299,6 +300,9 @@ impl cosmic::Application for Window {
             Message::CopiedReset => self.copied = false,
             Message::SetShowTrack(show) => {
                 self.write_config(|config, handler| config.set_show_track(handler, show));
+            }
+            Message::SetPanelLook(look) => {
+                self.write_config(|config, handler| config.set_panel_look(handler, look));
             }
             Message::Poll => return self.refresh_player(),
             Message::Tick => {
