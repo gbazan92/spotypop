@@ -20,6 +20,16 @@ flatpak remote-add --if-not-exists --user cosmic https://apt.pop-os.org/cosmic/c
 flatpak install --user cosmic io.github.gbazan92.SpotyPop
 ```
 
+> [!NOTE]
+> SpotyPop is under review for the COSMIC Flatpak repository
+> ([pop-os/cosmic-flatpak#331](https://github.com/pop-os/cosmic-flatpak/pull/331)).
+> Until it is published, install the bundle from the
+> [latest release](https://github.com/gbazan92/spotypop/releases/latest):
+>
+> ```sh
+> flatpak install --user SpotyPop-0.1.0.flatpak
+> ```
+
 Then add **SpotyPop** to the panel from COSMIC Settings → Desktop → Panel → Applets.
 
 You need Spotify Premium: the Web API only controls playback for Premium accounts.
