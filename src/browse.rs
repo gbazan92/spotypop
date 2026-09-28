@@ -1,7 +1,7 @@
-//! The library half of the popup: search, playlists, podcasts, audiobooks,
+//! The library half of the popup: search, queue, playlists and podcasts,
 //! the contents of whatever is opened, and the device picker.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use cosmic::widget::image::Handle;
@@ -25,9 +25,9 @@ const VISIBLE_ROWS: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Search,
+    Queue,
     Playlists,
     Podcasts,
-    Books,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,14 +75,19 @@ pub struct Library {
     search_generation: u64,
     pub results: Load<Vec<SearchGroup>>,
     pub recent: Load<Vec<Entry>>,
+    pub queue: Load<Vec<Entry>>,
+    queue_generation: u64,
+    /// Tracks just removed, so a stale reload cannot put them back.
+    dropped: Vec<(String, std::time::Instant)>,
     pub playlists: Load<Vec<Entry>>,
     pub liked_count: u64,
     pub shows: Load<Vec<Entry>>,
-    pub books: Load<Vec<Entry>>,
     pub detail: Option<Detail>,
     pub devices: Option<Load<Vec<Device>>>,
     pub thumbs: HashMap<String, Option<Handle>>,
     pub notice: Option<String>,
+    /// Tracks just added to the queue, until the notice goes away.
+    pub queued: HashSet<String>,
     notice_generation: u64,
     /// Scroll offset of each list, so closing the popup does not jump back up.
     scroll: HashMap<String, f32>,
@@ -97,9 +102,9 @@ impl Default for Library {
     fn default() -> Self {
         let tabs = SingleSelectModel::builder()
             .insert(|tab| tab.text("Buscar").data(Tab::Search).activate())
+            .insert(|tab| tab.text("Cola").data(Tab::Queue))
             .insert(|tab| tab.text("Playlists").data(Tab::Playlists))
             .insert(|tab| tab.text("Podcasts").data(Tab::Podcasts))
-            .insert(|tab| tab.text("Libros").data(Tab::Books))
             .build();
         Self {
             tabs,
@@ -108,14 +113,17 @@ impl Default for Library {
             search_generation: 0,
             results: Load::Idle,
             recent: Load::Idle,
+            queue: Load::Idle,
+            queue_generation: 0,
+            dropped: Vec::new(),
             playlists: Load::Idle,
             liked_count: 0,
             shows: Load::Idle,
-            books: Load::Idle,
             detail: None,
             devices: None,
             thumbs: HashMap::new(),
             notice: None,
+            queued: HashSet::new(),
             notice_generation: 0,
             scroll: HashMap::new(),
             scroll_live: false,
@@ -138,15 +146,27 @@ impl Library {
     fn saved_scroll(&self) -> f32 {
         self.scroll.get(&self.scroll_key()).copied().unwrap_or(0.0)
     }
+
+    /// Drops one copy of each track the user just removed, if Spotify still lists it.
+    fn without_dropped(&mut self, mut entries: Vec<Entry>) -> Vec<Entry> {
+        let now = std::time::Instant::now();
+        self.dropped.retain(|(_, until)| *until > now);
+        for (uri, _) in &self.dropped {
+            if let Some(index) = entries.iter().position(|entry| entry.uri == *uri) {
+                entries.remove(index);
+            }
+        }
+        entries
+    }
 }
 
 impl Tab {
     fn name(self) -> &'static str {
         match self {
             Self::Search => "search",
+            Self::Queue => "queue",
             Self::Playlists => "playlists",
             Self::Podcasts => "podcasts",
-            Self::Books => "books",
         }
     }
 }
@@ -161,8 +181,8 @@ pub enum Browse {
     SearchLoaded(u64, Result<Vec<SearchGroup>, spotify::Error>),
     RecentLoaded(Result<Vec<Entry>, spotify::Error>),
     PlaylistsLoaded(Result<(Vec<Entry>, u64), spotify::Error>),
+    QueueLoaded(u64, Result<Vec<Entry>, spotify::Error>),
     ShowsLoaded(Result<Vec<Entry>, spotify::Error>),
-    BooksLoaded(Result<Vec<Entry>, spotify::Error>),
     /// A row was clicked: open a context, or play an item.
     Activate(Entry),
     /// Play a whole context without opening it.
@@ -172,6 +192,9 @@ pub enum Browse {
     CloseDetail,
     PlayDetail,
     Queue(Entry),
+    Queued(String, String, Result<(), spotify::Error>),
+    Dequeue(usize),
+    Dequeued(String, Result<(), spotify::Error>),
     ThumbLoaded(String, Option<Handle>),
     Reload,
     ToggleDevices,
@@ -277,14 +300,24 @@ impl Window {
                 };
                 return self.enqueue_thumbs();
             }
+            Browse::QueueLoaded(generation, result) => {
+                if generation != self.library.queue_generation {
+                    return Task::none();
+                }
+                self.note_error(&result);
+                let queue = match result {
+                    Err(spotify::Error::NoDevice | spotify::Error::NotFound(_)) => {
+                        Load::Ready(Vec::new())
+                    }
+                    Ok(entries) => Load::Ready(self.library.without_dropped(entries)),
+                    Err(error) => Load::Failed(error.to_string()),
+                };
+                self.library.queue = queue;
+                return self.enqueue_thumbs();
+            }
             Browse::ShowsLoaded(result) => {
                 self.note_error(&result);
                 self.library.shows = Load::from_result(result);
-                return self.enqueue_thumbs();
-            }
-            Browse::BooksLoaded(result) => {
-                self.note_error(&result);
-                self.library.books = Load::from_result(result);
                 return self.enqueue_thumbs();
             }
             Browse::Activate(entry) => return self.activate(entry),
@@ -301,9 +334,54 @@ impl Window {
             }
             Browse::PlayDetail => return self.play_detail(),
             Browse::Queue(entry) => {
+                let Some(spotify) = self.client() else {
+                    return Task::none();
+                };
                 let uri = entry.uri.clone();
-                let task = self.command(move |spotify| async move { spotify.queue(&uri).await });
-                return Task::batch([task, self.notify(format!("En cola: {}", entry.name))]);
+                let name = entry.name.clone();
+                return Task::perform(
+                    async move {
+                        let result = spotify.queue(&uri).await;
+                        (name, uri, result)
+                    },
+                    |(name, uri, result)| browse(Browse::Queued(name, uri, result)),
+                );
+            }
+            Browse::Dequeue(index) => return self.remove_from_queue(index),
+            Browse::Dequeued(name, result) => {
+                return match result {
+                    Ok(()) => self.notify(format!("Saqué «{name}» de la cola")),
+                    Err(error) => {
+                        self.library.queue = Load::Idle;
+                        self.handle_api_error(&error);
+                        if self.library.tab == Tab::Queue {
+                            self.ensure_library()
+                        } else {
+                            Task::none()
+                        }
+                    }
+                };
+            }
+            Browse::Queued(name, uri, result) => {
+                return match result {
+                    Ok(()) => {
+                        self.library.dropped.retain(|(dropped, _)| dropped != &uri);
+                        self.library.queued.insert(uri);
+                        self.library.queue = Load::Idle;
+                        let notice = self.notify(format!("En cola: {name}"));
+                        let refresh = if self.library.tab == Tab::Queue {
+                            self.ensure_library()
+                        } else {
+                            Task::none()
+                        };
+                        Task::batch([notice, refresh])
+                    }
+                    Err(error) => {
+                        self.library.notice = None;
+                        self.handle_api_error(&error);
+                        Task::none()
+                    }
+                };
             }
             Browse::ThumbLoaded(url, handle) => {
                 self.library.thumbs_inflight = self.library.thumbs_inflight.saturating_sub(1);
@@ -320,9 +398,9 @@ impl Window {
                         self.library.search_generation += 1;
                         return Task::batch([self.run_search(), self.refresh_player()]);
                     }
+                    Tab::Queue => self.library.queue = Load::Idle,
                     Tab::Playlists => self.library.playlists = Load::Idle,
                     Tab::Podcasts => self.library.shows = Load::Idle,
-                    Tab::Books => self.library.books = Load::Idle,
                 }
                 if let Some(detail) = self.library.detail.as_mut() {
                     detail.items = Load::Idle;
@@ -367,6 +445,7 @@ impl Window {
             Browse::ClearNotice(generation) => {
                 if generation == self.library.notice_generation {
                     self.library.notice = None;
+                    self.library.queued.clear();
                 }
             }
         }
@@ -394,6 +473,17 @@ impl Window {
                 }
             }
             Tab::Search => {}
+            Tab::Queue => {
+                if matches!(library.queue, Load::Idle) {
+                    library.queue = Load::Loading;
+                    library.queue_generation = library.queue_generation.wrapping_add(1);
+                    let generation = library.queue_generation;
+                    return Task::perform(
+                        async move { spotify.playback_queue().await },
+                        move |result| browse(Browse::QueueLoaded(generation, result)),
+                    );
+                }
+            }
             Tab::Playlists => {
                 if matches!(library.playlists, Load::Idle) {
                     library.playlists = Load::Loading;
@@ -411,16 +501,6 @@ impl Window {
                         spotify,
                         |spotify| async move { spotify.shows().await },
                         Browse::ShowsLoaded,
-                    );
-                }
-            }
-            Tab::Books => {
-                if matches!(library.books, Load::Idle) {
-                    library.books = Load::Loading;
-                    return fetch(
-                        spotify,
-                        |spotify| async move { spotify.audiobooks().await },
-                        Browse::BooksLoaded,
                     );
                 }
             }
@@ -565,6 +645,57 @@ impl Window {
         Some((first, follow))
     }
 
+    /// Spotify has no "remove from queue". Rebuild what will play, without that row.
+    fn remove_from_queue(&mut self, index: usize) -> Task<Action<Message>> {
+        let Load::Ready(items) = &self.library.queue else {
+            return Task::none();
+        };
+        if index >= items.len() {
+            return Task::none();
+        }
+        let name = items[index].name.clone();
+        let removed = items[index].uri.clone();
+        let mut uris = Vec::new();
+        if let Some(current) = self.item().map(|item| item.uri.clone()) {
+            uris.push(current);
+        }
+        uris.extend(
+            items
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| *at != index)
+                .map(|(_, entry)| entry.uri.clone()),
+        );
+        let was_playing = self.is_playing();
+        let position = self.progress_ms();
+        self.hold_progress();
+        // Drop any queue snapshot that left before this removal.
+        self.library.queue_generation = self.library.queue_generation.wrapping_add(1);
+        self.library
+            .dropped
+            .push((removed, std::time::Instant::now() + Duration::from_secs(20)));
+        if let Load::Ready(list) = &mut self.library.queue {
+            list.remove(index);
+        }
+        let Some(spotify) = self.client() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                if !uris.is_empty() {
+                    // One request, already at the current position, so the bar
+                    // does not jump to the start and then seek forward.
+                    spotify.play_uris_at(&uris, position).await?;
+                    if !was_playing {
+                        let _ = spotify.pause().await;
+                    }
+                }
+                Ok(())
+            },
+            move |result| browse(Browse::Dequeued(name, result)),
+        )
+    }
+
     fn play_detail(&mut self) -> Task<Action<Message>> {
         let Some(detail) = &self.library.detail else {
             return Task::none();
@@ -658,9 +789,9 @@ impl Window {
                 Load::Ready(groups) => groups.iter().flat_map(|group| &group.entries).collect(),
                 _ => Vec::new(),
             },
+            Tab::Queue => ready(&library.queue),
             Tab::Playlists => ready(&library.playlists),
             Tab::Podcasts => ready(&library.shows),
-            Tab::Books => ready(&library.books),
         }
     }
 
@@ -750,6 +881,7 @@ impl Window {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spotify::{Entry, EntryKind};
 
     #[test]
     fn each_list_keeps_its_own_scroll() {
@@ -765,5 +897,37 @@ mod tests {
         assert!(library.saved_scroll().abs() < f32::EPSILON);
         library.detail = None;
         assert!((library.saved_scroll() - 240.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_removed_track_stays_out_of_a_stale_queue() {
+        let mut library = Library::default();
+        library.dropped.push((
+            "spotify:track:caudillo".into(),
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        ));
+        let stale = vec![
+            entry("spotify:track:otro"),
+            entry("spotify:track:caudillo"),
+            entry("spotify:track:caudillo"),
+        ];
+        let kept = library.without_dropped(stale);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].uri, "spotify:track:otro");
+        assert_eq!(kept[1].uri, "spotify:track:caudillo");
+    }
+
+    fn entry(uri: &str) -> Entry {
+        Entry {
+            kind: EntryKind::Track,
+            id: String::new(),
+            uri: uri.to_owned(),
+            name: String::new(),
+            detail: String::new(),
+            parent_uri: None,
+            duration_ms: 0,
+            art_url: None,
+            playable: true,
+        }
     }
 }

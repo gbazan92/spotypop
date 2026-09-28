@@ -35,9 +35,21 @@ uninstall:
     pkill -F {{player-pid}} -f {{player}} 2>/dev/null || true
     rm -f {{bin-dir}}/{{name}} {{bin-dir}}/{{player}} {{desktop-dst}} {{icon-dst}}
 
-# Restarts the panel to load the new binary; the receiver keeps playing
+# Restarts only this applet. Killing cosmic-panel drops the whole bar, and
+# the session is slow to bring it back. The panel respawns this process.
+# Match the executable, not the command line: a pkill -f of this path also
+# hits the shell that is running the recipe.
 reload:
-    pkill -x cosmic-panel || true
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target='{{bin-dir}}/{{name}}'
+    for dir in /proc/[0-9]*; do
+        exe=$(readlink "$dir/exe" 2>/dev/null || true)
+        # After install the running binary is the same path with " (deleted)".
+        if [ "$exe" = "$target" ] || [ "$exe" = "$target (deleted)" ]; then
+            kill "${dir##*/}" 2>/dev/null || true
+        fi
+    done
 
 # Restarts the receiver too, after installing a new build of it
 restart-player:

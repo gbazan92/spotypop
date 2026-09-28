@@ -83,6 +83,8 @@ pub struct Window {
     volume_generation: u64,
     /// Value shown on the slider until a poll reports the same number.
     volume_held: Option<(u8, Instant)>,
+    /// Progress kept on screen while a queue edit restarts playback underneath.
+    progress_held: Option<(u64, Instant, bool)>,
     volume_before_mute: Option<u8>,
     scroll_notches: f32,
     pub(crate) copied: bool,
@@ -185,6 +187,7 @@ impl cosmic::Application for Window {
             seek_drag: None,
             volume_generation: 0,
             volume_held: None,
+            progress_held: None,
             volume_before_mute: None,
             scroll_notches: 0.0,
             copied: false,
@@ -551,6 +554,23 @@ impl Window {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             return position.max(0.0) as u64;
         }
+        if let Some((held, at, playing)) = self.progress_held {
+            let mut progress = held;
+            if playing {
+                let elapsed = u64::try_from(at.elapsed().as_millis()).unwrap_or(0);
+                progress = progress.saturating_add(elapsed);
+            }
+            let duration = self
+                .player
+                .as_ref()
+                .and_then(|player| player.item.as_ref())
+                .map_or(0, |item| item.duration_ms);
+            return if duration > 0 {
+                progress.min(duration)
+            } else {
+                progress
+            };
+        }
         let Some(player) = self.player.as_ref() else {
             return 0;
         };
@@ -573,6 +593,12 @@ impl Window {
             player.progress_ms = progress;
         }
         self.fetched_at = Instant::now();
+    }
+
+    /// Keeps the progress bar still while Spotify restarts the same track.
+    pub(crate) fn hold_progress(&mut self) {
+        let progress = self.progress_ms();
+        self.progress_held = Some((progress, Instant::now(), self.is_playing()));
     }
 
     fn poll_interval(&self) -> Duration {
@@ -780,6 +806,26 @@ impl Window {
             } else if let Some(device) = player.as_mut().and_then(|player| player.device.as_mut()) {
                 device.volume = Some(held);
             }
+        }
+        if let Some((held, at, playing)) = self.progress_held {
+            let elapsed = u64::try_from(at.elapsed().as_millis()).unwrap_or(0);
+            let expected = if playing {
+                held.saturating_add(elapsed)
+            } else {
+                held
+            };
+            let reported = player.as_ref().map(|player| player.progress_ms);
+            let caught_up = reported.is_some_and(|ms| ms.abs_diff(expected) < 4_000);
+            if caught_up || at.elapsed() > Duration::from_secs(5) {
+                self.progress_held = None;
+            }
+        }
+        // Rebuilding the queue makes Spotify answer "nothing playing" for a
+        // moment. Dropping the track here shrinks the panel back to the icon.
+        if self.progress_held.is_some()
+            && player.as_ref().is_none_or(|player| player.item.is_none())
+        {
+            return Task::none();
         }
         if let Some(item) = self.item() {
             self.last_item = Some(item.clone());

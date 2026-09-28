@@ -3,6 +3,7 @@ use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, LineHeight, 
 use cosmic::iced::{Alignment, Color, Length, Limits};
 use cosmic::theme;
 use cosmic::widget::button::Catalog;
+use cosmic::widget::segmented_button::StyleSheet;
 use cosmic::widget::{
     Column, Id, Row, button, container, divider, dropdown, icon, image, mouse_area, scrollable,
     segmented_control, settings, slider, space, text, text_input, toggler, tooltip,
@@ -283,11 +284,11 @@ fn player_view(state: &Window) -> Element<'_, Message> {
         (false, _) => "Nada sonando".to_owned(),
     };
 
-    let status: Element<'_, Message> = match (&state.library.notice, &state.error) {
-        (Some(notice), None) => one_line(text::caption(notice.as_str()))
+    let status: Element<'_, Message> = match &state.library.notice {
+        Some(notice) => one_line(text::caption(notice.as_str()))
             .class(theme::Text::Accent)
             .into(),
-        _ => status_line(state, status),
+        None => status_line(state, status),
     };
 
     let device_label = device.map_or("Dispositivos", |device| device.name.as_str());
@@ -701,6 +702,13 @@ fn library(state: &Window) -> Element<'_, Message> {
     } else {
         column = column.push(
             segmented_control::horizontal(&library.tabs)
+                // Control draws a check on the active tab. The accent already marks it.
+                .style(theme::SegmentedButton::Custom(Box::new(|theme| {
+                    <cosmic::Theme as StyleSheet>::horizontal(
+                        theme,
+                        &theme::SegmentedButton::Control,
+                    )
+                })))
                 .on_activate(|entity| Message::Browse(Browse::SelectTab(entity))),
         );
         if library.tab == Tab::Search {
@@ -718,6 +726,11 @@ fn library(state: &Window) -> Element<'_, Message> {
             scrollable(list_body(state))
                 .id(Id::new(LIBRARY_SCROLL))
                 .on_scroll(|viewport| Message::LibraryScrolled(viewport.absolute_offset().y))
+                .scrollbar_width(4.0)
+                .scroller_width(4.0)
+                .scrollbar_padding(2.0)
+                // Sit the bar beside the rows, instead of on top of the add buttons.
+                .spacing(10.0)
                 .height(LIST_HEIGHT),
         )
         .into()
@@ -726,7 +739,7 @@ fn library(state: &Window) -> Element<'_, Message> {
 fn list_body(state: &Window) -> Element<'_, Message> {
     let library = &state.library;
     if let Some(detail) = &library.detail {
-        return entries_or(state, &detail.items, "Esta lista está vacía.", None);
+        return entries_or(state, &detail.items, "Esta lista está vacía.", None, false);
     }
     match library.tab {
         Tab::Search if library.query.trim().is_empty() => entries_or(
@@ -734,6 +747,7 @@ fn list_body(state: &Window) -> Element<'_, Message> {
             &library.recent,
             "Todavía no escuchaste nada. Buscá algo para empezar.",
             Some(section_title("Escuchado recientemente")),
+            false,
         ),
         Tab::Search => match &library.results {
             Load::Idle | Load::Loading => placeholder_text("Buscando…"),
@@ -744,29 +758,32 @@ fn list_body(state: &Window) -> Element<'_, Message> {
                 for group in groups {
                     column = column.push(section_title(group_title(group.kind)));
                     for entry in &group.entries {
-                        column = column.push(entry_row(state, entry));
+                        column = column.push(entry_row(state, entry, None));
                     }
                 }
                 column.into()
             }
         },
+        Tab::Queue => entries_or(
+            state,
+            &library.queue,
+            "La cola está vacía. Agregá un tema con +.",
+            None,
+            true,
+        ),
         Tab::Playlists => entries_or(
             state,
             &library.playlists,
             "Todavía no tenés playlists.",
             Some(liked_row(library.liked_count)),
+            false,
         ),
         Tab::Podcasts => entries_or(
             state,
             &library.shows,
             "No seguís ningún podcast. Buscá uno y seguilo en Spotify.",
             None,
-        ),
-        Tab::Books => entries_or(
-            state,
-            &library.books,
-            "No guardaste audiolibros todavía.",
-            None,
+            false,
         ),
     }
 }
@@ -776,6 +793,7 @@ fn entries_or<'a>(
     load: &'a Load<Vec<Entry>>,
     empty: &'a str,
     header: Option<Element<'a, Message>>,
+    removable: bool,
 ) -> Element<'a, Message> {
     match load {
         Load::Idle | Load::Loading => placeholder_text("Cargando…"),
@@ -788,8 +806,9 @@ fn entries_or<'a>(
             if list.is_empty() {
                 return column.push(placeholder_text(empty)).into();
             }
-            for entry in list {
-                column = column.push(entry_row(state, entry));
+            for (index, entry) in list.iter().enumerate() {
+                let remove_at = removable.then_some(index);
+                column = column.push(entry_row(state, entry, remove_at));
             }
             column.into()
         }
@@ -858,7 +877,11 @@ fn round_card(theme: &cosmic::Theme, radius: f32) -> cosmic::iced::widget::conta
     }
 }
 
-fn entry_row<'a>(state: &'a Window, entry: &'a Entry) -> Element<'a, Message> {
+fn entry_row<'a>(
+    state: &'a Window,
+    entry: &'a Entry,
+    remove_at: Option<usize>,
+) -> Element<'a, Message> {
     let round = entry.kind == EntryKind::Artist;
     let thumb: Element<'a, Message> = match entry
         .art_url
@@ -895,26 +918,11 @@ fn entry_row<'a>(state: &'a Window, entry: &'a Entry) -> Element<'a, Message> {
                 .push(one_line(text::caption(entry.detail.as_str())).class(DIM)),
         );
 
-    if entry.kind.is_item() {
-        if entry.duration_ms > 0 {
-            row = row.push(text::caption(format_time(entry.duration_ms)).class(DIM));
-        }
-        row = row.push(
-            button::icon(icon::from_name("list-add-symbolic"))
-                .extra_small()
-                .tooltip("Agregar a la cola")
-                .on_press(Message::Browse(Browse::Queue(entry.clone()))),
-        );
-    } else {
-        row = row.push(
-            button::icon(icon::from_name("media-playback-start-symbolic"))
-                .extra_small()
-                .tooltip("Reproducir")
-                .on_press(Message::Browse(Browse::PlayContext(entry.clone()))),
-        );
+    if entry.duration_ms > 0 && entry.kind.is_item() {
+        row = row.push(text::caption(format_time(entry.duration_ms)).class(DIM));
     }
 
-    button::custom(row)
+    let open = button::custom(row)
         .padding([6, 8])
         .width(Length::Fill)
         .class(theme::Button::AppletMenu)
@@ -923,7 +931,40 @@ fn entry_row<'a>(state: &'a Window, entry: &'a Entry) -> Element<'a, Message> {
             entry
                 .playable
                 .then(|| Message::Browse(Browse::Activate(entry.clone()))),
-        )
+        );
+
+    // The action sits beside the row. Inside it, the click never arrived.
+    let action = if let Some(index) = remove_at {
+        button::icon(icon::from_name("list-remove-symbolic"))
+            .extra_small()
+            .tooltip("Sacar de la cola")
+            .on_press(Message::Browse(Browse::Dequeue(index)))
+    } else if entry.kind.is_item() {
+        let queued = state.library.queued.contains(&entry.uri);
+        button::icon(icon::from_name(if queued {
+            "emblem-ok-symbolic"
+        } else {
+            "list-add-symbolic"
+        }))
+        .extra_small()
+        .tooltip(if queued {
+            "En la cola"
+        } else {
+            "Agregar a la cola"
+        })
+        .on_press(Message::Browse(Browse::Queue(entry.clone())))
+    } else {
+        button::icon(icon::from_name("media-playback-start-symbolic"))
+            .extra_small()
+            .tooltip("Reproducir")
+            .on_press(Message::Browse(Browse::PlayContext(entry.clone())))
+    };
+
+    Row::new()
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .push(open)
+        .push(action)
         .into()
 }
 
@@ -1195,7 +1236,7 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
     };
 
     let mut panel = settings::section().title("Panel").add(settings::item(
-        "Mostrar título y artista",
+        "Mostrar en la barra",
         toggler(state.config.show_track).on_toggle(Message::SetShowTrack),
     ));
     if state.config.show_track {
