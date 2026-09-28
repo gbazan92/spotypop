@@ -18,7 +18,8 @@ const FRAME: Duration = Duration::from_millis(33);
 
 pub struct Marquee<'a, Message> {
     content: Element<'a, Message>,
-    max_width: f32,
+    /// Caps the width. `None` means use whatever width the parent gives.
+    max_width: Option<f32>,
 }
 
 /// `content` must not wrap, so its natural width is the whole line.
@@ -28,7 +29,15 @@ pub fn marquee<'a, Message>(
 ) -> Marquee<'a, Message> {
     Marquee {
         content: content.into(),
-        max_width,
+        max_width: Some(max_width),
+    }
+}
+
+/// Same scrolling line, stretched to the width it is given.
+pub fn marquee_fill<'a, Message>(content: impl Into<Element<'a, Message>>) -> Marquee<'a, Message> {
+    Marquee {
+        content: content.into(),
+        max_width: None,
     }
 }
 
@@ -47,7 +56,12 @@ fn content_width(layout: Layout<'_>) -> f32 {
 
 impl<Message> Widget<Message, Theme, Renderer> for Marquee<'_, Message> {
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Shrink, Length::Shrink)
+        let width = if self.max_width.is_some() {
+            Length::Shrink
+        } else {
+            Length::Fill
+        };
+        Size::new(width, Length::Shrink)
     }
 
     fn tag(&self) -> tree::Tag {
@@ -79,7 +93,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Marquee<'_, Message> {
                 .as_widget_mut()
                 .layout(&mut tree.children[0], renderer, &unbounded);
         let natural = content.size();
-        let width = natural.width.min(self.max_width).min(limits.max().width);
+        let offered = limits.max().width;
+        let width = match self.max_width {
+            Some(max) => natural.width.min(max).min(offered),
+            None if offered.is_finite() => offered,
+            None => natural.width,
+        };
         layout::Node::with_children(Size::new(width, natural.height), vec![content])
     }
 

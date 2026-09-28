@@ -1,5 +1,6 @@
 //! Winamp-style panel scopes. Each one is exactly as wide as the track title
-//! and exactly one icon tall, so the bar never grows.
+//! and exactly one icon tall, so the bar never grows. They follow the real
+//! audio when this computer plays (see [`feed`]) and loop an animation otherwise.
 
 use std::f32::consts::TAU;
 
@@ -10,6 +11,8 @@ use cosmic::iced::advanced::{Layout, Shell, Widget, layout, mouse, renderer};
 use cosmic::iced::time::{Duration, Instant};
 use cosmic::iced::{Background, Border, Color, Event, Length, Point, Rectangle, Size, window};
 use cosmic::{Element, Renderer, Theme};
+
+use crate::feed;
 
 const FRAME: Duration = Duration::from_millis(33);
 const COLUMNS: usize = 28;
@@ -25,8 +28,6 @@ pub enum ScopeKind {
     Bars,
     /// A line that runs the width, like an oscilloscope.
     Wave,
-    /// The same columns, mirrored from the middle.
-    Mirror,
     /// The wave drawn as a filled ribbon.
     Fill,
 }
@@ -45,17 +46,28 @@ pub fn scope<'a, Message: 'a>(
     })
 }
 
-fn tick<Message>(playing: bool, shell: &mut Shell<'_, Message>, now: Instant) {
-    if playing {
+/// How fast a column drops once the music gets quieter, in heights per second.
+const LEVEL_FALL: f32 = 3.0;
+const PEAK_FALL: f32 = 0.35;
+const LIVE_PEAK_FALL: f32 = 0.6;
+const IDLE_LEVEL: f32 = 0.16;
+
+fn tick<Message>(animate: bool, shell: &mut Shell<'_, Message>, now: Instant) {
+    if animate {
         shell.request_redraw_at(now + FRAME);
     }
 }
 
+/// What the scope shows: live audio when this computer is playing, otherwise
+/// a loop that only suggests music.
 struct Clock {
     phase: f32,
     at: Option<Instant>,
+    live: bool,
+    levels: [f32; COLUMNS],
     /// Peak hold for each column; it eases down so the caps trail the bars.
     peaks: [f32; COLUMNS],
+    wave: [f32; feed::WAVE],
 }
 
 impl Default for Clock {
@@ -63,32 +75,66 @@ impl Default for Clock {
         Self {
             phase: 0.0,
             at: None,
+            live: false,
+            levels: [0.0; COLUMNS],
             peaks: [0.0; COLUMNS],
+            wave: [0.0; feed::WAVE],
         }
     }
 }
 
 impl Clock {
-    fn advance(&mut self, playing: bool, now: Instant, columns: usize) {
+    fn advance(&mut self, playing: bool, now: Instant) {
         let step = self
             .at
             .map_or(0.0, |at| now.saturating_duration_since(at).as_secs_f32());
-        if playing {
+        let frame = feed::latest();
+        self.live = frame.is_some();
+        let moving = playing || self.live;
+        self.at = moving.then_some(now);
+        if playing && !self.live {
             self.phase = (self.phase + step * 1.15).rem_euclid(TAU);
-            self.at = Some(now);
-        } else {
-            self.at = None;
         }
-        for index in 0..columns.min(COLUMNS) {
-            let level = column_level(index, columns, self.phase);
+
+        let columns = COLUMNS;
+        let peak_fall = if self.live { LIVE_PEAK_FALL } else { PEAK_FALL };
+        for index in 0..columns {
+            let target = frame.as_ref().map_or_else(
+                || column_level(index, columns, self.phase),
+                |frame| band_level(&frame.bands, index, columns),
+            );
+            let level = &mut self.levels[index];
+            *level = if target >= *level || step == 0.0 {
+                target
+            } else {
+                (*level - step * LEVEL_FALL).max(target)
+            };
+            let level = *level;
             let peak = &mut self.peaks[index];
-            if playing && level >= *peak {
+            if moving && level >= *peak {
                 *peak = level;
             } else {
-                *peak = (*peak - step * 0.35).max(if playing { level } else { 0.16 });
+                *peak = (*peak - step * peak_fall).max(if moving { level } else { IDLE_LEVEL });
             }
         }
+
+        let last = px(feed::WAVE - 1);
+        for (index, sample) in self.wave.iter_mut().enumerate() {
+            *sample = match &frame {
+                Some(frame) => (frame.wave[index] - *sample).mul_add(0.6, *sample),
+                None => wave_sample(px(index) / last, self.phase),
+            };
+        }
     }
+}
+
+/// The loudest band under a column, so no transient gets averaged away.
+fn band_level(bands: &[f32; feed::BANDS], index: usize, columns: usize) -> f32 {
+    let start = index * feed::BANDS / columns;
+    let end = ((index + 1) * feed::BANDS)
+        .div_ceil(columns)
+        .clamp(start + 1, feed::BANDS);
+    bands[start..end].iter().copied().fold(0.0, f32::max)
 }
 
 /// A value in `0.0..=1.0`. Every term uses a whole number of cycles, so the
@@ -154,15 +200,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Scope {
         let Event::Window(window::Event::RedrawRequested(now)) = event else {
             return;
         };
-        let columns = if self.kind == ScopeKind::Mirror {
-            COLUMNS / 2
-        } else {
-            COLUMNS
-        };
-        tree.state
-            .downcast_mut::<Clock>()
-            .advance(self.playing, *now, columns);
-        tick(self.playing, shell, *now);
+        let clock = tree.state.downcast_mut::<Clock>();
+        clock.advance(self.playing, *now);
+        tick(self.playing || clock.live, shell, *now);
     }
 
     fn draw(
@@ -178,72 +218,38 @@ impl<Message> Widget<Message, Theme, Renderer> for Scope {
         let bounds = layout.bounds();
         let clock = tree.state.downcast_ref::<Clock>();
         let mut color = Color::from(theme.cosmic().accent_color());
-        if !self.playing {
+        if !self.playing && !clock.live {
             color.a *= 0.45;
         }
         match self.kind {
-            ScopeKind::Bars => draw_bars(renderer, bounds, clock, color, false),
-            ScopeKind::Mirror => draw_bars(renderer, bounds, clock, color, true),
-            ScopeKind::Wave => draw_wave(renderer, bounds, clock.phase, color, false),
-            ScopeKind::Fill => draw_wave(renderer, bounds, clock.phase, color, true),
+            ScopeKind::Bars => draw_bars(renderer, bounds, clock, color),
+            ScopeKind::Wave => draw_wave(renderer, bounds, &clock.wave, color, false),
+            ScopeKind::Fill => draw_wave(renderer, bounds, &clock.wave, color, true),
         }
     }
 }
 
-fn draw_bars(
-    renderer: &mut Renderer,
-    bounds: Rectangle,
-    clock: &Clock,
-    color: Color,
-    mirror: bool,
-) {
-    let count = if mirror { COLUMNS / 2 } else { COLUMNS };
-    let columns = if mirror { COLUMNS } else { count };
-    let slot = bounds.width / px(columns);
+fn draw_bars(renderer: &mut Renderer, bounds: Rectangle, clock: &Clock, color: Color) {
+    let slot = bounds.width / px(COLUMNS);
     let bar = (slot * 0.72).max(1.0);
     let gap = slot - bar;
-    for index in 0..count {
-        let level = column_level(index, count, clock.phase);
-        let peak = clock.peaks[index];
-        paint_column(
-            renderer, bounds, color, index, mirror, bar, gap, level, peak,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_column(
-    renderer: &mut Renderer,
-    bounds: Rectangle,
-    color: Color,
-    index: usize,
-    mirror: bool,
-    bar: f32,
-    gap: f32,
-    level: f32,
-    peak: f32,
-) {
-    // One piece up to the held peak. A separate cap leaves a hairline gap
-    // under the tip of some columns.
-    let height = (bounds.height * peak.max(level)).round().max(2.0);
     let width = bar.round().max(1.0);
     let step = bar + gap;
-    let slots = if mirror {
-        let center = bounds.x + bounds.width / 2.0 + gap / 2.0;
-        [center - px(index + 1) * step, center + px(index) * step]
-    } else {
-        let origin = bounds.x + gap / 2.0;
-        [origin + px(index) * step, f32::NAN]
-    };
-    for x in slots {
-        if !x.is_finite() {
-            continue;
-        }
+    let origin = bounds.x + gap / 2.0;
+    for index in 0..COLUMNS {
+        // One piece up to the held peak. A separate cap leaves a hairline gap
+        // under the tip of some columns.
+        let height = (bounds.height * clock.peaks[index].max(clock.levels[index]))
+            .round()
+            .max(2.0);
         column_quad(
             renderer,
             color,
             Rectangle::new(
-                Point::new(x.round(), (bounds.y + bounds.height - height).round()),
+                Point::new(
+                    (origin + px(index) * step).round(),
+                    (bounds.y + bounds.height - height).round(),
+                ),
                 Size::new(width, height),
             ),
             1.0,
@@ -265,25 +271,32 @@ fn column_quad(renderer: &mut Renderer, color: Color, bounds: Rectangle, radius:
     );
 }
 
-fn draw_wave(renderer: &mut Renderer, bounds: Rectangle, phase: f32, color: Color, fill: bool) {
+/// `points` evenly spread from the left edge (`x = 0`) to the right (`x = 1`).
+fn sample_at(points: &[f32; feed::WAVE], x: f32) -> f32 {
+    let position = x.clamp(0.0, 1.0) * px(feed::WAVE - 1);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let lower = (position.floor() as usize).min(feed::WAVE - 2);
+    let t = position - px(lower);
+    (points[lower + 1] - points[lower]).mul_add(t, points[lower])
+}
+
+fn draw_wave(
+    renderer: &mut Renderer,
+    bounds: Rectangle,
+    points: &[f32; feed::WAVE],
+    color: Color,
+    fill: bool,
+) {
     // One sample per pixel, plus a little overlap, so slices never leave a seam.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let count = (bounds.width.round() as usize).clamp(48, 180);
     let step = bounds.width / px(count);
     let mid = bounds.y + bounds.height / 2.0;
     let amp = bounds.height * 0.40;
+    let last = px(count - 1);
     for index in 0..count {
-        let x = px(index) / px(count);
-        let y = mid - wave_sample(x, phase) * amp;
-        let previous = wave_sample(
-            if index == 0 {
-                1.0
-            } else {
-                px(index - 1) / px(count)
-            },
-            phase,
-        );
-        let y0 = mid - previous * amp;
+        let y = mid - sample_at(points, px(index) / last) * amp;
+        let y0 = mid - sample_at(points, px(index.saturating_sub(1)) / last) * amp;
         let slice = if fill {
             let top = y.min(mid);
             Rectangle::new(
@@ -317,5 +330,25 @@ mod tests {
             assert!((wave_sample(x, 0.0) - wave_sample(x, TAU)).abs() < 1e-4);
         }
         assert!((wave_sample(0.0, 1.3) - wave_sample(1.0, 1.3)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn every_band_reaches_a_column() {
+        for columns in [COLUMNS, COLUMNS / 2] {
+            for band in 0..feed::BANDS {
+                let mut bands = [0.0; feed::BANDS];
+                bands[band] = 1.0;
+                let lit = (0..columns).filter(|&i| band_level(&bands, i, columns) > 0.0);
+                assert!(lit.count() >= 1, "band {band} with {columns} columns");
+            }
+        }
+    }
+
+    #[test]
+    fn waves_interpolate_between_points() {
+        let mut points = [0.0; feed::WAVE];
+        points[feed::WAVE - 1] = 1.0;
+        assert!(sample_at(&points, 0.0).abs() < f32::EPSILON);
+        assert!((sample_at(&points, 1.0) - 1.0).abs() < f32::EPSILON);
     }
 }

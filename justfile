@@ -6,6 +6,8 @@ bin-dir := env('HOME') / '.local/bin'
 desktop-dst := env('HOME') / '.local/share/applications' / appid + '.desktop'
 icon-src := 'res/icons/hicolor/scalable/apps' / appid + '-symbolic.svg'
 icon-dst := env('HOME') / '.local/share/icons/hicolor/scalable/apps' / appid + '-symbolic.svg'
+# pkill -x only sees the first 15 characters of a name, too few for the receiver
+player-pid := env('XDG_RUNTIME_DIR', '/run/user/' + `id -u`) / name / 'player.pid'
 
 default: build
 
@@ -30,7 +32,7 @@ install: build
     install -Dm0644 {{icon-src}} {{icon-dst}}
 
 uninstall:
-    pkill -x {{player}} || true
+    pkill -F {{player-pid}} -f {{player}} 2>/dev/null || true
     rm -f {{bin-dir}}/{{name}} {{bin-dir}}/{{player}} {{desktop-dst}} {{icon-dst}}
 
 # Restarts the panel to load the new binary; the receiver keeps playing
@@ -39,7 +41,7 @@ reload:
 
 # Restarts the receiver too, after installing a new build of it
 restart-player:
-    pkill -x {{player}} || true
+    pkill -F {{player-pid}} -f {{player}} 2>/dev/null || true
 
 dev: install reload
 

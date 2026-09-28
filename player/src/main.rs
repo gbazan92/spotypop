@@ -3,9 +3,12 @@
 //! `login` authorizes this computer once and stores a reusable librespot
 //! credential; `run` registers a Connect device that plays through
 //! PulseAudio/PipeWire. The applet drives it through the Web API like any other
-//! device, so the music keeps going when the panel restarts.
+//! device, so the music keeps going when the panel restarts. While it plays,
+//! the panel scopes follow the actual audio through a local socket.
 
 mod paths;
+mod scope;
+mod sink;
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -23,11 +26,12 @@ use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
-use librespot_playback::audio_backend;
-use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
+use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::mixer::{self, Mixer, MixerConfig};
 use librespot_playback::player::Player;
 use sha2::{Digest, Sha256};
+
+use crate::sink::{PulseTap, Tap};
 
 /// librespot's own default; any loopback port is accepted by Spotify's client.
 const DEFAULT_OAUTH_PORT: u16 = 5588;
@@ -265,13 +269,15 @@ async fn run(name: String) -> Result<(), Failure> {
         ..PlayerConfig::default()
     };
 
-    let (sink, mixer) = audio()?;
+    let mixer = mixer()?;
+    let tap = Arc::new(Tap::default());
+    let scope = tokio::spawn(scope::serve(Arc::clone(&tap)));
     let mut session = Session::new(session_config.clone(), Some(cache.clone()));
     let player = Player::new(
         player_config,
         session.clone(),
         mixer.get_soft_volume(),
-        move || sink(None, AudioFormat::S16),
+        move || Box::new(PulseTap::new(tap)),
     );
 
     #[allow(clippy::cast_possible_truncation)]
@@ -341,19 +347,18 @@ async fn run(name: String) -> Result<(), Failure> {
 
     let _ = spirc.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    scope.abort();
+    let _ = fs::remove_file(paths::scope_socket());
     Ok(())
 }
 
-/// `PulseAudio` output (`PipeWire` serves it too) with librespot's own volume.
-fn audio() -> Result<(audio_backend::SinkBuilder, Arc<dyn Mixer>), Failure> {
-    let sink = audio_backend::find(Some("pulseaudio".into()))
-        .ok_or_else(|| Failure::Other("the PulseAudio backend is not compiled in".into()))?;
-    let mixer = mixer::find(Some("softvol"))
+/// librespot's own software volume.
+fn mixer() -> Result<Arc<dyn Mixer>, Failure> {
+    mixer::find(Some("softvol"))
         .ok_or_else(|| Failure::Other("the software mixer is not compiled in".into()))?(
         MixerConfig::default(),
     )
-    .map_err(other("mixer"))?;
-    Ok((sink, mixer))
+    .map_err(other("mixer"))
 }
 
 fn allow_reconnect(attempts: &mut VecDeque<Instant>, now: Instant) -> bool {

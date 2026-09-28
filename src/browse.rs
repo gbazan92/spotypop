@@ -79,6 +79,11 @@ pub struct Library {
     pub thumbs: HashMap<String, Option<Handle>>,
     pub notice: Option<String>,
     notice_generation: u64,
+    /// Scroll offset of each list, so closing the popup does not jump back up.
+    scroll: HashMap<String, f32>,
+    /// False while a saved offset is being put back, so the jump to the top
+    /// is not stored over the real position.
+    scroll_live: bool,
 }
 
 impl Default for Library {
@@ -105,6 +110,34 @@ impl Default for Library {
             thumbs: HashMap::new(),
             notice: None,
             notice_generation: 0,
+            scroll: HashMap::new(),
+            scroll_live: false,
+        }
+    }
+}
+
+impl Library {
+    /// Which list is on screen: an open playlist, or one of the tabs.
+    fn scroll_key(&self) -> String {
+        if let Some(detail) = &self.detail {
+            format!("detail:{}", detail.source.key())
+        } else {
+            format!("tab:{}", self.tab.name())
+        }
+    }
+
+    fn saved_scroll(&self) -> f32 {
+        self.scroll.get(&self.scroll_key()).copied().unwrap_or(0.0)
+    }
+}
+
+impl Tab {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Playlists => "playlists",
+            Self::Podcasts => "podcasts",
+            Self::Books => "books",
         }
     }
 }
@@ -165,7 +198,7 @@ impl Window {
                     self.library.tab = tab;
                 }
                 self.library.detail = None;
-                return self.ensure_library();
+                return Task::batch([self.ensure_library(), self.restore_library_scroll()]);
             }
             Browse::Query(query) => {
                 self.library.query = query;
@@ -240,11 +273,32 @@ impl Window {
                 if let Some(detail) = self.library.detail.as_mut()
                     && detail.source.key() == key
                 {
-                    detail.items = Load::from_result(result);
-                    return self.fetch_visible_thumbs();
+                    // Since February 2026 Spotify only lists tracks of playlists
+                    // the user owns or collaborates on. A public one still plays.
+                    let blocked = matches!(
+                        (&result, &detail.source),
+                        (
+                            Err(spotify::Error::Forbidden(_)),
+                            Source::Entry(entry)
+                        ) if entry.kind == EntryKind::Playlist
+                    );
+                    detail.items = if blocked {
+                        Load::Failed(
+                            "Spotify no deja ver las canciones de una playlist que no es tuya ni en la que colaborás. Pero aún así, podés reproducirla.".into(),
+                        )
+                    } else {
+                        Load::from_result(result)
+                    };
+                    return Task::batch([
+                        self.fetch_visible_thumbs(),
+                        self.restore_library_scroll(),
+                    ]);
                 }
             }
-            Browse::CloseDetail => self.library.detail = None,
+            Browse::CloseDetail => {
+                self.library.detail = None;
+                return self.restore_library_scroll();
+            }
             Browse::PlayDetail => return self.play_detail(),
             Browse::Queue(entry) => {
                 let uri = entry.uri.clone();
@@ -431,6 +485,8 @@ impl Window {
             return Task::none();
         };
         let key = source.key().to_owned();
+        // The list is about to be replaced. Ignore the placeholder's scroll.
+        self.library.scroll_live = false;
         self.library.detail = Some(Detail {
             source: source.clone(),
             items: Load::Loading,
@@ -463,6 +519,43 @@ impl Window {
                 self.command(move |spotify| async move { spotify.play_uris(&uris).await })
             }
         }
+    }
+
+    pub(crate) fn remember_library_scroll(&mut self, offset: f32) {
+        if !self.library.scroll_live {
+            return;
+        }
+        let key = self.library.scroll_key();
+        if offset < 1.0 {
+            self.library.scroll.remove(&key);
+        } else {
+            self.library.scroll.insert(key, offset);
+        }
+    }
+
+    /// The popup is a new window every time it opens, so the list has to be
+    /// scrolled again once that window exists.
+    pub(crate) fn restore_library_scroll(&mut self) -> Task<Action<Message>> {
+        self.library.scroll_live = false;
+        let offset = self.library.saved_scroll();
+        delayed(
+            Duration::from_millis(80),
+            Message::ApplyLibraryScroll(offset),
+        )
+    }
+
+    pub(crate) fn apply_library_scroll(&mut self, offset: f32) -> Task<Action<Message>> {
+        self.library.scroll_live = true;
+        if offset < 1.0 {
+            return Task::none();
+        }
+        cosmic::iced::widget::scrollable::scroll_to(
+            cosmic::widget::Id::new(crate::ui::LIBRARY_SCROLL),
+            cosmic::iced::widget::scrollable::AbsoluteOffset {
+                x: Some(0.0),
+                y: Some(offset),
+            },
+        )
     }
 
     pub(crate) fn notify(&mut self, text: String) -> Task<Action<Message>> {
@@ -540,5 +633,26 @@ impl Window {
             })
             .collect();
         Task::batch(tasks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_list_keeps_its_own_scroll() {
+        let mut library = Library::default();
+        assert_eq!(library.scroll_key(), "tab:search");
+        library.tab = Tab::Playlists;
+        library.scroll.insert(library.scroll_key(), 240.0);
+        library.detail = Some(Detail {
+            source: Source::Liked,
+            items: Load::Idle,
+        });
+        assert_eq!(library.scroll_key(), "detail:liked");
+        assert!(library.saved_scroll().abs() < f32::EPSILON);
+        library.detail = None;
+        assert!((library.saved_scroll() - 240.0).abs() < f32::EPSILON);
     }
 }

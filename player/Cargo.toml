@@ -11,10 +11,13 @@ description = "Local Spotify Connect receiver for cosmic-ext-applet-spotify"
 [dependencies]
 env_logger = { version = "0.11", default-features = false }
 libc = "0.2.189"
+libpulse-binding = "2.30.1"
+libpulse-simple-binding = "2.29.0"
 librespot-connect = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
 librespot-core = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
 librespot-oauth = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
-librespot-playback = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["pulseaudio-backend", "rustls-tls-native-roots"] }
+librespot-playback = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
 log = "0.4"
+rustfft = "6.4.1"
 sha2 = "0.11.0"
-tokio = { version = "1.53.1", features = ["macros", "rt", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }

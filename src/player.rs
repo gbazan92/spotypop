@@ -31,14 +31,22 @@ fn credentials_dir() -> PathBuf {
     state_dir().join("player")
 }
 
-fn pid_file() -> PathBuf {
+fn runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         // SAFETY: getuid cannot fail.
         .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })))
         .join(APP_DIR)
-        .join("player.pid")
+}
+
+fn pid_file() -> PathBuf {
+    runtime_dir().join("player.pid")
+}
+
+/// Where the receiver streams what is sounding; see `src/feed.rs`.
+pub fn scope_socket() -> PathBuf {
+    runtime_dir().join("scope.sock")
 }
 
 /// Installed next to the applet, both by `just install` and in the Flatpak.

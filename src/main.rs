@@ -2,6 +2,7 @@ mod art;
 mod browse;
 mod browser;
 mod config;
+mod feed;
 mod look;
 mod marquee;
 mod player;

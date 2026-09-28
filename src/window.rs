@@ -58,6 +58,8 @@ pub enum Playback {
 pub struct Window {
     pub(crate) core: Core,
     popup: Option<Id>,
+    /// Last size of the panel button, so the popup can be anchored to it.
+    panel_size: Option<(u32, u32)>,
     pub(crate) view: View,
     config_handler: Option<Config>,
     pub(crate) config: AppConfig,
@@ -103,8 +105,12 @@ pub enum Message {
     OpenDashboard,
     CopyRedirectUri,
     CopiedReset,
+    LibraryScrolled(f32),
+    ApplyLibraryScroll(f32),
     SetShowTrack(bool),
     SetPanelLook(PanelLook),
+    PanelResized(Id, cosmic::iced::Size),
+    RealignPopup,
     Poll,
     Tick,
     PlayerLoaded(Box<Result<Option<PlayerState>, spotify::Error>>),
@@ -155,6 +161,7 @@ impl cosmic::Application for Window {
         let mut window = Self {
             core,
             popup: None,
+            panel_size: None,
             view: View::Player,
             config_handler,
             client_id_draft: config.client_id.clone(),
@@ -218,7 +225,7 @@ impl cosmic::Application for Window {
             }
             Message::ShowPlayer => {
                 self.view = View::Player;
-                return self.ensure_library();
+                return Task::batch([self.ensure_library(), self.restore_library_scroll()]);
             }
             Message::PopupClosed(id) => {
                 if self.popup == Some(id) {
@@ -298,12 +305,27 @@ impl cosmic::Application for Window {
                 ]);
             }
             Message::CopiedReset => self.copied = false,
+            Message::LibraryScrolled(offset) => self.remember_library_scroll(offset),
+            Message::ApplyLibraryScroll(offset) => return self.apply_library_scroll(offset),
             Message::SetShowTrack(show) => {
                 self.write_config(|config, handler| config.set_show_track(handler, show));
             }
             Message::SetPanelLook(look) => {
                 self.write_config(|config, handler| config.set_panel_look(handler, look));
             }
+            Message::PanelResized(id, size) => {
+                if self.core.main_window_id() != Some(id) {
+                    return Task::none();
+                }
+                let next = (px(size.width), px(size.height));
+                if next.0 == 0 || next.1 == 0 || self.panel_size == Some(next) {
+                    return Task::none();
+                }
+                self.panel_size = Some(next);
+                // The panel moves the button a moment after the resize.
+                return delayed(Duration::from_millis(80), Message::RealignPopup);
+            }
+            Message::RealignPopup => return self.realign_popup(),
             Message::Poll => return self.refresh_player(),
             Message::Tick => {
                 // A track that ran out locally has changed on Spotify's side too.
@@ -464,6 +486,7 @@ impl cosmic::Application for Window {
                 Message::ConfigChanged(update.config)
             }),
             activation_token_subscription(0).map(Message::Token),
+            cosmic::iced::window::resize_events().map(|(id, size)| Message::PanelResized(id, size)),
         ];
         if matches!(self.session, Session::Connected(_)) {
             subscriptions.push(time::every(self.poll_interval()).map(|_| Message::Poll));
@@ -874,44 +897,73 @@ impl Window {
         surface_task(destroy_popup(popup))
     }
 
+    /// Anchors the popup to the panel button's real rectangle. The default
+    /// one is only icon-sized, so it drifts once the button grows or shrinks.
+    fn popup_settings(
+        &self,
+        parent: Id,
+        popup: Id,
+    ) -> cosmic::iced::platform_specific::runtime::wayland::popup::SctkPopupSettings {
+        let mut settings = self
+            .core
+            .applet
+            .get_popup_settings(parent, popup, None, None, None);
+        settings.positioner.size_limits = Limits::NONE
+            .min_width(360.0)
+            .max_width(ui::POPUP_WIDTH)
+            .min_height(120.0)
+            .max_height(1000.0);
+        match self.core.applet.anchor {
+            PanelAnchor::Top => {
+                settings.positioner.anchor = Anchor::BottomLeft;
+                settings.positioner.gravity = Gravity::BottomRight;
+            }
+            PanelAnchor::Bottom => {
+                settings.positioner.anchor = Anchor::TopLeft;
+                settings.positioner.gravity = Gravity::TopRight;
+            }
+            PanelAnchor::Left | PanelAnchor::Right => {}
+        }
+        if let Some((width, height)) = self.panel_size {
+            settings.positioner.anchor_rect.width = i32::try_from(width).unwrap_or(i32::MAX);
+            settings.positioner.anchor_rect.height = i32::try_from(height).unwrap_or(i32::MAX);
+        }
+        settings
+    }
+
+    fn realign_popup(&self) -> Task<Action<Message>> {
+        let (Some(popup), Some(parent)) = (self.popup, self.core.main_window_id()) else {
+            return Task::none();
+        };
+        let settings = self.popup_settings(parent, popup);
+        cosmic::iced::platform_specific::shell::wayland::commands::popup::reposition(
+            popup,
+            settings.positioner,
+        )
+    }
+
     fn open_popup(&mut self) -> Task<Action<Message>> {
         let Some(parent) = self.core.main_window_id() else {
             return Task::none();
         };
 
-        surface_task(app_popup::<Window>(
+        let open = surface_task(app_popup::<Window>(
             |_| LiveSettings::default(),
             move |state: &mut Window| {
                 let popup = Id::unique();
-                let mut settings = state
-                    .core
-                    .applet
-                    .get_popup_settings(parent, popup, None, None, None);
-                settings.positioner.size_limits = Limits::NONE
-                    .min_width(360.0)
-                    .max_width(ui::POPUP_WIDTH)
-                    .min_height(120.0)
-                    .max_height(1000.0);
-                // The default anchor centers the popup on an icon-sized applet,
-                // which misaligns it under the wider cover-and-title button.
-                match state.core.applet.anchor {
-                    PanelAnchor::Top => {
-                        settings.positioner.anchor = Anchor::BottomLeft;
-                        settings.positioner.gravity = Gravity::BottomRight;
-                    }
-                    PanelAnchor::Bottom => {
-                        settings.positioner.anchor = Anchor::TopLeft;
-                        settings.positioner.gravity = Gravity::TopRight;
-                    }
-                    PanelAnchor::Left | PanelAnchor::Right => {}
-                }
+                let settings = state.popup_settings(parent, popup);
                 state.popup = Some(popup);
                 settings
             },
             Some(Box::new(|state: &Window| {
                 ui::popup(state).map(cosmic::Action::App)
             })),
-        ))
+        ));
+        if self.view == View::Player {
+            Task::batch([open, self.restore_library_scroll()])
+        } else {
+            open
+        }
     }
 }
 
@@ -919,6 +971,11 @@ pub(crate) fn delayed(after: Duration, message: Message) -> Task<Action<Message>
     Task::perform(tokio::time::sleep(after), move |()| {
         Action::App(message.clone())
     })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn px(value: f32) -> u32 {
+    value.round().max(0.0) as u32
 }
 
 fn surface_task(action: cosmic::surface::Action) -> Task<Action<Message>> {

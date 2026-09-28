@@ -12,27 +12,21 @@ pub const DEFAULT_REDIRECT_PORT: u16 = 8888;
 pub enum PanelLook {
     #[default]
     Cover,
+    #[serde(alias = "mirror", alias = "dots")]
     Bars,
+    #[serde(alias = "trail")]
     Wave,
-    Mirror,
     Fill,
 }
 
 impl PanelLook {
-    pub const ALL: [Self; 5] = [
-        Self::Cover,
-        Self::Bars,
-        Self::Wave,
-        Self::Mirror,
-        Self::Fill,
-    ];
+    pub const ALL: [Self; 4] = [Self::Cover, Self::Bars, Self::Wave, Self::Fill];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Cover => "Portada y título",
             Self::Bars => "Barras",
             Self::Wave => "Ondas",
-            Self::Mirror => "Espejo",
             Self::Fill => "Relleno",
         }
     }
@@ -110,5 +104,21 @@ mod tests {
         labels.dedup();
         assert_eq!(labels.len(), count);
         assert_eq!(PanelLook::Cover.index(), 0);
+    }
+
+    #[test]
+    fn old_look_names_still_load() {
+        assert_eq!(
+            serde_json::from_str::<PanelLook>("\"dots\"").unwrap(),
+            PanelLook::Bars
+        );
+        assert_eq!(
+            serde_json::from_str::<PanelLook>("\"trail\"").unwrap(),
+            PanelLook::Wave
+        );
+        assert_eq!(
+            serde_json::from_str::<PanelLook>("\"wave\"").unwrap(),
+            PanelLook::Wave
+        );
     }
 }

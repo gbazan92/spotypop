@@ -2,15 +2,16 @@ use cosmic::Element;
 use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, LineHeight, Wrapping};
 use cosmic::iced::{Alignment, Color, Length, Limits};
 use cosmic::theme;
+use cosmic::widget::button::Catalog;
 use cosmic::widget::{
-    Column, Row, button, container, divider, dropdown, icon, image, mouse_area, scrollable,
-    segmented_control, settings, slider, space, text, text_input, toggler,
+    Column, Id, Row, button, container, divider, dropdown, icon, image, mouse_area, scrollable,
+    segmented_control, settings, slider, space, text, text_input, toggler, tooltip,
 };
 
 use crate::browse::{Browse, Load, Source, Tab};
 use crate::config::PanelLook;
 use crate::look::{self, scope};
-use crate::marquee::marquee;
+use crate::marquee::{marquee, marquee_fill};
 use crate::spotify::{Device, Entry, EntryKind, Item, ItemKind, Repeat, Session};
 use crate::window::{Message, Playback, View, Window};
 
@@ -22,6 +23,7 @@ const HERO_RADIUS: f32 = 10.0;
 const VOLUME_SLIDER_WIDTH: f32 = 110.0;
 const ROW_ART: f32 = 40.0;
 const LIST_HEIGHT: f32 = 300.0;
+pub const LIBRARY_SCROLL: &str = "library-list";
 
 const LOGO: &[u8] = include_bytes!(
     "../res/icons/hicolor/scalable/apps/io.github.gbazan92.CosmicExtAppletSpotify-symbolic.svg"
@@ -199,12 +201,6 @@ fn playing_chip<'a>(
             cover_size,
             playing,
         ),
-        PanelLook::Mirror => scope(
-            look::ScopeKind::Mirror,
-            PANEL_LABEL_WIDTH,
-            cover_size,
-            playing,
-        ),
         PanelLook::Fill => scope(
             look::ScopeKind::Fill,
             PANEL_LABEL_WIDTH,
@@ -346,7 +342,7 @@ fn playback_banner(state: &Window) -> Option<Element<'_, Message>> {
         Playback::NeedsLogin => (
             "Aprobalo una vez en el navegador y la música sale por esta compu, sin abrir Spotify.",
             Some(nowrap_button(
-                "Activar",
+                "Vincular",
                 theme::Button::Suggested,
                 Message::EnablePlayback,
             )),
@@ -482,21 +478,12 @@ fn hero(state: &Window) -> Element<'_, Message> {
     };
 
     let mut title_row = Row::new()
+        .width(Length::Fill)
         .spacing(6)
         .align_y(Alignment::Center)
-        .push(one_line(text::title4(title)).width(Length::Fill));
+        .push(marquee_fill(text::title4(title).wrapping(Wrapping::None)));
     if active {
-        let saved = state.saved.unwrap_or(false);
-        title_row = title_row.push(
-            button::icon(icon::from_name("emblem-favorite-symbolic"))
-                .selected(saved)
-                .tooltip(if saved {
-                    "Quitar de tu biblioteca"
-                } else {
-                    "Guardar en tu biblioteca"
-                })
-                .on_press(Message::ToggleSaved),
-        );
+        title_row = title_row.push(save_button(state.saved.unwrap_or(false)));
     }
 
     let duration = state.item().map_or(0, |item| item.duration_ms);
@@ -527,7 +514,9 @@ fn hero(state: &Window) -> Element<'_, Message> {
         .spacing(4)
         .width(Length::Fill)
         .push(title_row)
-        .push(one_line(text::body(detail)).class(DIM))
+        .push(marquee_fill(
+            text::body(detail).wrapping(Wrapping::None).class(DIM),
+        ))
         .push(space::vertical().height(4))
         .push(seek)
         .push(times);
@@ -628,6 +617,55 @@ fn transport(state: &Window) -> Element<'_, Message> {
 
 // ---------------------------------------------------------------- library
 
+/// The icon button style drops the accent, so the heart is drawn on its own
+/// and tinted with the system accent while the track is saved.
+fn save_button(saved: bool) -> Element<'static, Message> {
+    let button = button::custom(icon::from_name("emblem-favorite-symbolic").size(16))
+        .padding(4)
+        .class(heart_class(saved))
+        .on_press(Message::ToggleSaved);
+    tooltip(
+        button,
+        text::body(if saved {
+            "Quitar de tu biblioteca"
+        } else {
+            "Guardar en tu biblioteca"
+        }),
+        tooltip::Position::Top,
+    )
+    .into()
+}
+
+fn heart_class(saved: bool) -> theme::Button {
+    theme::Button::Custom {
+        active: Box::new(move |focused, theme| heart_look(theme, focused, saved, Heart::Idle)),
+        hovered: Box::new(move |focused, theme| heart_look(theme, focused, saved, Heart::Hover)),
+        pressed: Box::new(move |focused, theme| heart_look(theme, focused, saved, Heart::Press)),
+        disabled: Box::new(|theme| heart_look(theme, false, false, Heart::Off)),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Heart {
+    Idle,
+    Hover,
+    Press,
+    Off,
+}
+
+fn heart_look(theme: &cosmic::Theme, focused: bool, saved: bool, heart: Heart) -> button::Style {
+    let mut style = match heart {
+        Heart::Idle => theme.active(focused, false, &theme::Button::Icon),
+        Heart::Hover => theme.hovered(focused, false, &theme::Button::Icon),
+        Heart::Press => theme.pressed(focused, false, &theme::Button::Icon),
+        Heart::Off => theme.disabled(&theme::Button::Icon),
+    };
+    if saved {
+        style.icon_color = Some(Color::from(theme.cosmic().accent_color()));
+    }
+    style
+}
+
 fn placeholder_text(message: &str) -> Element<'_, Message> {
     container(text::body(message).class(DIM).align_x(Alignment::Center))
         .padding([24, 16])
@@ -676,7 +714,12 @@ fn library(state: &Window) -> Element<'_, Message> {
     }
 
     column
-        .push(scrollable(list_body(state)).height(LIST_HEIGHT))
+        .push(
+            scrollable(list_body(state))
+                .id(Id::new(LIBRARY_SCROLL))
+                .on_scroll(|viewport| Message::LibraryScrolled(viewport.absolute_offset().y))
+                .height(LIST_HEIGHT),
+        )
         .into()
 }
 
@@ -1093,14 +1136,14 @@ fn account_row<'a>(
 fn playback_row(state: &Window) -> Element<'_, Message> {
     match state.playback {
         Playback::Ready => account_row(
-            format!("Activa como «{}»", state.device_name),
-            "Desactivar",
+            format!("Vinculada como «{}»", state.device_name),
+            "Desvincular",
             theme::Button::Standard,
             Message::DisablePlayback,
         ),
         Playback::NeedsLogin => account_row(
-            "Desactivada".to_owned(),
-            "Activar",
+            "Sin vincular".to_owned(),
+            "Vincular",
             theme::Button::Suggested,
             Message::EnablePlayback,
         ),
@@ -1127,7 +1170,7 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
             account_row(
                 format!("Conectado como {who}"),
                 "Cerrar sesión",
-                theme::Button::Destructive,
+                theme::Button::Suggested,
                 Message::Logout,
             )
         }
