@@ -9,6 +9,7 @@ use cosmic::widget::segmented_button::{Entity, SingleSelectModel};
 use cosmic::{Action, Task};
 
 use crate::art;
+use crate::fl;
 use crate::spotify::{
     self, Device, Entry, EntryKind, Item, ItemKind, SearchGroup, Session, Spotify,
 };
@@ -113,10 +114,10 @@ pub struct Library {
 impl Default for Library {
     fn default() -> Self {
         let tabs = SingleSelectModel::builder()
-            .insert(|tab| tab.text("Buscar").data(Tab::Search).activate())
-            .insert(|tab| tab.text("Cola").data(Tab::Queue))
-            .insert(|tab| tab.text("Playlists").data(Tab::Playlists))
-            .insert(|tab| tab.text("Podcasts").data(Tab::Podcasts))
+            .insert(|tab| tab.text(fl!("tab-search")).data(Tab::Search).activate())
+            .insert(|tab| tab.text(fl!("tab-queue")).data(Tab::Queue))
+            .insert(|tab| tab.text(fl!("tab-playlists")).data(Tab::Playlists))
+            .insert(|tab| tab.text(fl!("tab-podcasts")).data(Tab::Podcasts))
             .build();
         Self {
             tabs,
@@ -452,7 +453,7 @@ impl Window {
             Browse::Dequeue(index) => return self.remove_from_queue(index),
             Browse::Dequeued(name, result) => {
                 return match result {
-                    Ok(()) => self.notify(format!("Saqué «{name}» de la cola")),
+                    Ok(()) => self.notify(fl!("queue-removed", track = name)),
                     Err(error) => {
                         self.library.queue = Load::Idle;
                         self.handle_api_error(&error);
@@ -470,7 +471,7 @@ impl Window {
                         self.library.dropped.retain(|(dropped, _)| dropped != &uri);
                         self.library.queued.insert(uri);
                         self.library.queue = Load::Idle;
-                        let notice = self.notify(format!("En cola: {name}"));
+                        let notice = self.notify(fl!("queue-queued", track = name));
                         let refresh = if self.library.tab == Tab::Queue {
                             self.ensure_library()
                         } else {
@@ -581,13 +582,7 @@ impl Window {
             Tab::Search => {}
             Tab::Queue => {
                 if matches!(library.queue, Load::Idle) {
-                    library.queue = Load::Loading;
-                    library.queue_generation = library.queue_generation.wrapping_add(1);
-                    let generation = library.queue_generation;
-                    return Task::perform(
-                        async move { spotify.playback_queue().await },
-                        move |result| browse(Browse::QueueLoaded(generation, result)),
-                    );
+                    return self.refresh_queue();
                 }
             }
             Tab::Playlists => {
@@ -612,6 +607,24 @@ impl Window {
             }
         }
         Task::none()
+    }
+
+    /// Fetches the queue again, keeping a list already on screen until the new
+    /// one arrives.
+    pub(crate) fn refresh_queue(&mut self) -> Task<Action<Message>> {
+        let Some(spotify) = self.client() else {
+            return Task::none();
+        };
+        let library = &mut self.library;
+        if !matches!(library.queue, Load::Ready(_)) {
+            library.queue = Load::Loading;
+        }
+        library.queue_generation = library.queue_generation.wrapping_add(1);
+        let generation = library.queue_generation;
+        Task::perform(
+            async move { spotify.playback_queue().await },
+            move |result| browse(Browse::QueueLoaded(generation, result)),
+        )
     }
 
     fn run_search(&mut self) -> Task<Action<Message>> {
@@ -755,7 +768,7 @@ impl Window {
                             if entry.kind == EntryKind::Playlist
                     );
                     detail.items = Load::Failed(if blocked {
-                        "Por limitaciones y restricciones de la API de Spotify, no puedo mostrarte las canciones. No te preocupes, podés reproducirlas y verlas en la sección Cola.".into()
+                        fl!("playlist-forbidden")
                     } else {
                         error.to_string()
                     });
@@ -1018,14 +1031,14 @@ mod tests {
     #[test]
     fn a_track_just_played_stays_ahead_of_spotifys_history() {
         let mut library = Library::default();
-        library.remember_item(&played("spotify:track:nueva", "Nueva"));
+        library.remember_item(&played("spotify:track:new", "New"));
         let Load::Ready(list) = &library.recent else {
             panic!("recent list");
         };
-        assert_eq!(list[0].name, "Nueva");
-        let merged = compose_recent(&library.heard, &[entry("spotify:track:vieja")]);
-        assert_eq!(merged[0].uri, "spotify:track:nueva");
-        assert_eq!(merged[1].uri, "spotify:track:vieja");
+        assert_eq!(list[0].name, "New");
+        let merged = compose_recent(&library.heard, &[entry("spotify:track:old")]);
+        assert_eq!(merged[0].uri, "spotify:track:new");
+        assert_eq!(merged[1].uri, "spotify:track:old");
     }
 
     #[test]
@@ -1071,18 +1084,18 @@ mod tests {
     fn a_removed_track_stays_out_of_a_stale_queue() {
         let mut library = Library::default();
         library.dropped.push((
-            "spotify:track:caudillo".into(),
+            "spotify:track:removed".into(),
             std::time::Instant::now() + std::time::Duration::from_secs(20),
         ));
         let stale = vec![
-            entry("spotify:track:otro"),
-            entry("spotify:track:caudillo"),
-            entry("spotify:track:caudillo"),
+            entry("spotify:track:other"),
+            entry("spotify:track:removed"),
+            entry("spotify:track:removed"),
         ];
         let kept = library.without_dropped(stale);
         assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].uri, "spotify:track:otro");
-        assert_eq!(kept[1].uri, "spotify:track:caudillo");
+        assert_eq!(kept[0].uri, "spotify:track:other");
+        assert_eq!(kept[1].uri, "spotify:track:removed");
     }
 
     fn entry(uri: &str) -> Entry {

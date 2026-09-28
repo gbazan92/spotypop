@@ -1,6 +1,6 @@
-name := 'cosmic-ext-applet-spotify'
-player := 'cosmic-ext-spotify-player'
-appid := 'io.github.gbazan92.CosmicExtAppletSpotify'
+name := 'spotypop'
+player := 'spotypop-player'
+appid := 'io.github.gbazan92.SpotyPop'
 
 bin-dir := env('HOME') / '.local/bin'
 desktop-dst := env('HOME') / '.local/share/applications' / appid + '.desktop'

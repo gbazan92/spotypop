@@ -21,12 +21,13 @@ use cosmic::{Action, Element, Task};
 use crate::art::{self, Artwork};
 use crate::browse::{Browse, Library};
 use crate::config::{self, AppConfig, PanelLook};
+use crate::fl;
 use crate::spotify::{self, Item, PlayerState, Repeat, Session, Spotify, Store, User};
 use crate::{browser, player, ui};
 
-pub const APP_ID: &str = "io.github.gbazan92.CosmicExtAppletSpotify";
+pub const APP_ID: &str = "io.github.gbazan92.SpotyPop";
 pub const DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
-const STATE_DIR: &str = "cosmic-ext-applet-spotify";
+const STATE_DIR: &str = "spotypop";
 
 const VOLUME_STEP: i16 = 5;
 /// Spotify takes a moment before a command shows up in `/me/player`.
@@ -580,7 +581,7 @@ impl cosmic::Application for Window {
                 match result {
                     Ok(()) => {
                         self.error = None;
-                        return self.notify("Listo, esta compu ya puede reproducir".into());
+                        return self.notify(fl!("playback-ready"));
                     }
                     Err(error) if self.playback != Playback::Ready => self.error = Some(error),
                     Err(_) => {}
@@ -880,10 +881,7 @@ impl Window {
     fn enable_playback(&mut self) -> Task<Action<Message>> {
         match self.playback {
             Playback::Missing => {
-                self.error = Some(format!(
-                    "Falta {} junto al applet; reinstalalo con «just install».",
-                    player::BINARY
-                ));
+                self.error = Some(fl!("playback-binary-missing", binary = player::BINARY));
                 Task::none()
             }
             Playback::Authorizing | Playback::Ready => Task::none(),
@@ -1020,6 +1018,7 @@ impl Window {
         {
             self.library.remember_item(&item);
             tasks.push(self.note_recent_stale());
+            tasks.push(self.note_queue_stale());
         }
         if let Some(uri) = self.item().map(|item| item.uri.clone())
             && uri != self.saved_uri
@@ -1048,6 +1047,20 @@ impl Window {
         if showing {
             self.ensure_library()
         } else {
+            Task::none()
+        }
+    }
+
+    /// A new track means a new "up next", whether it came from a playlist, the
+    /// queue itself, or another device.
+    fn note_queue_stale(&mut self) -> Task<Action<Message>> {
+        let showing = self.popup.is_some()
+            && self.library.detail.is_none()
+            && self.library.tab == crate::browse::Tab::Queue;
+        if showing {
+            self.refresh_queue()
+        } else {
+            self.library.queue = crate::browse::Load::Idle;
             Task::none()
         }
     }

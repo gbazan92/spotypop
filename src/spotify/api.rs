@@ -230,7 +230,7 @@ impl Spotify {
     pub async fn me(&self) -> Result<User, Error> {
         let raw: Option<RawMe> = self.get("/me", &[]).await?;
         raw.map(User::from)
-            .ok_or_else(|| Error::Network("perfil vacío".into()))
+            .ok_or_else(|| Error::Network("empty profile".into()))
     }
 
     /// `None` when nothing is playing on any device.
@@ -660,14 +660,14 @@ impl Spotify {
     pub async fn artwork(&self, url: &str) -> Result<Vec<u8>, Error> {
         if !art_url_allowed(url) {
             return Err(Error::BadArgument(format!(
-                "portada fuera del CDN de Spotify: {url:.60}"
+                "cover outside Spotify's CDN: {url:.60}"
             )));
         }
         let response = self.http.client().get(url).send().await?;
         if !response.status().is_success() {
             return Err(Error::Http {
                 status: response.status().as_u16(),
-                message: "no se pudo descargar la portada".into(),
+                message: "could not download the cover".into(),
             });
         }
         http::read_capped(response, ART_MAX_BYTES).await

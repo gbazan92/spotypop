@@ -11,6 +11,7 @@ use cosmic::widget::{
 
 use crate::browse::{Browse, Load, Source, Tab};
 use crate::config::PanelLook;
+use crate::fl;
 use crate::look::{self, scope};
 use crate::marquee::{marquee, marquee_fill};
 use crate::spotify::{Device, Entry, EntryKind, Item, ItemKind, Repeat, Session};
@@ -26,9 +27,8 @@ const ROW_ART: f32 = 40.0;
 const LIST_HEIGHT: f32 = 300.0;
 pub const LIBRARY_SCROLL: &str = "library-list";
 
-const LOGO: &[u8] = include_bytes!(
-    "../res/icons/hicolor/scalable/apps/io.github.gbazan92.CosmicExtAppletSpotify-symbolic.svg"
-);
+const LOGO: &[u8] =
+    include_bytes!("../res/icons/hicolor/scalable/apps/io.github.gbazan92.SpotyPop-symbolic.svg");
 
 fn logo(size: u16) -> icon::Icon {
     icon::icon(icon::from_svg_bytes(LOGO).symbolic(true)).size(size)
@@ -240,7 +240,7 @@ fn header<'a>(
             Column::new()
                 .spacing(2)
                 .width(Length::Fill)
-                .push(text::heading("Spotify"))
+                .push(text::heading("SpotyPop"))
                 .push(status),
         );
     if let Some(actions) = actions {
@@ -266,11 +266,13 @@ fn player_view(state: &Window) -> Element<'_, Message> {
     let active = state.item().is_some();
 
     let status = match (active, device) {
-        (true, Some(device)) if state.is_playing() => format!("Reproduciendo en {}", device.name),
-        (true, Some(device)) => format!("En pausa en {}", device.name),
-        (true, None) => "En pausa".to_owned(),
-        (false, _) if !state.loaded => "Cargando…".to_owned(),
-        (false, _) => "Nada sonando".to_owned(),
+        (true, Some(device)) if state.is_playing() => {
+            fl!("status-playing-on", device = device.name.as_str())
+        }
+        (true, Some(device)) => fl!("status-paused-on", device = device.name.as_str()),
+        (true, None) => fl!("status-paused"),
+        (false, _) if !state.loaded => fl!("status-loading"),
+        (false, _) => fl!("nothing-playing"),
     };
 
     let status: Element<'_, Message> = match &state.library.notice {
@@ -280,7 +282,7 @@ fn player_view(state: &Window) -> Element<'_, Message> {
         None => status_line(state, status),
     };
 
-    let device_label = device.map_or("Dispositivos", |device| device.name.as_str());
+    let device_label = device.map_or_else(|| fl!("devices"), |device| device.name.clone());
     let device_icon = device.map_or("audio-speakers-symbolic", |device| {
         device_icon(&device.kind)
     });
@@ -303,7 +305,7 @@ fn player_view(state: &Window) -> Element<'_, Message> {
         .push(container(chip).max_width(160.0))
         .push(
             button::icon(icon::from_name("view-refresh-symbolic"))
-                .tooltip("Actualizar")
+                .tooltip(fl!("refresh"))
                 .on_press(Message::Browse(Browse::Reload)),
         );
 
@@ -327,28 +329,25 @@ fn player_view(state: &Window) -> Element<'_, Message> {
 
 /// Offers to turn this computer into a player until it is one.
 fn playback_banner(state: &Window) -> Option<Element<'_, Message>> {
-    let (lead, action): (&str, Option<Element<'_, Message>>) = match state.playback {
+    let (lead, action): (String, Option<Element<'_, Message>>) = match state.playback {
         Playback::Ready => return None,
         Playback::NeedsLogin => (
-            "Aprobalo una vez en el navegador y la música sale por esta compu, sin abrir Spotify.",
+            fl!("playback-lead"),
             Some(nowrap_button(
-                "Vincular",
+                fl!("playback-link"),
                 theme::Button::Suggested,
                 Message::EnablePlayback,
             )),
         ),
         Playback::Authorizing => (
-            "Esperando que apruebes en el navegador…",
+            fl!("waiting-browser-approval"),
             Some(nowrap_button(
-                "Cancelar",
+                fl!("cancel"),
                 theme::Button::Standard,
                 Message::CancelPlayback,
             )),
         ),
-        Playback::Missing => (
-            "Falta el reproductor local; reinstalá el applet con «just install».",
-            None,
-        ),
+        Playback::Missing => (fl!("playback-missing"), None),
     };
     let mut row = Row::new()
         .spacing(12)
@@ -358,7 +357,7 @@ fn playback_banner(state: &Window) -> Option<Element<'_, Message>> {
             Column::new()
                 .spacing(2)
                 .width(Length::Fill)
-                .push(text::heading("Escuchá en esta compu"))
+                .push(text::heading(fl!("playback-title")))
                 .push(text::caption(lead).class(DIM)),
         );
     if let Some(action) = action {
@@ -384,13 +383,13 @@ fn device_icon(kind: &str) -> &'static str {
 
 fn device_picker<'a>(state: &'a Window, devices: &'a Load<Vec<Device>>) -> Element<'a, Message> {
     let body: Element<'a, Message> = match devices {
-        Load::Idle | Load::Loading => placeholder_text("Buscando dispositivos…"),
+        Load::Idle | Load::Loading => placeholder_text(fl!("devices-searching")),
         Load::Failed(error) => text::caption(error.as_str()).class(ERROR).into(),
         Load::Ready(list) if list.is_empty() => {
             placeholder_text(if state.playback == Playback::Ready {
-                "El reproductor de esta compu está arrancando; probá de nuevo en unos segundos."
+                fl!("devices-local-starting")
             } else {
-                "No hay dispositivos. Activá la reproducción en esta compu o abrí Spotify en otro lado."
+                fl!("devices-none")
             })
         }
         Load::Ready(list) => {
@@ -456,15 +455,13 @@ fn hero(state: &Window) -> Element<'_, Message> {
 
     let title = match shown {
         Some(item) if active => item.name.clone(),
-        _ => "Nada sonando".to_owned(),
+        _ => fl!("nothing-playing"),
     };
     let detail = match shown {
         Some(item) if active => subtitle(item),
-        Some(item) => format!("Último: {}", item.name),
-        None if state.playback == Playback::Ready => {
-            "Elegí algo de abajo para escucharlo acá.".to_owned()
-        }
-        None => "Iniciá Spotify en algún dispositivo para verlo acá.".to_owned(),
+        Some(item) => fl!("hero-last", track = item.name.as_str()),
+        None if state.playback == Playback::Ready => fl!("hero-pick-below"),
+        None => fl!("hero-start-elsewhere"),
     };
 
     let mut title_row = Row::new()
@@ -525,13 +522,13 @@ fn transport(state: &Window) -> Element<'_, Message> {
     let shuffle = player.is_some_and(|player| player.shuffle);
     let repeat = player.map_or(Repeat::Off, |player| player.repeat);
 
-    let small = |name: &'static str, tooltip: &'static str, message: Message| {
+    let small = |name: &'static str, tooltip: String, message: Message| {
         button::icon(icon::from_name(name))
             .tooltip(tooltip)
             .on_press_maybe(active.then_some(message))
     };
     // The icon style drops `selected`, so a mode that is on paints itself in the accent.
-    let mode = |name: &'static str, tip: &'static str, message: Message, on: bool| {
+    let mode = |name: &'static str, tip: String, message: Message, on: bool| {
         let button = button::custom(icon::from_name(name).size(16))
             .padding(8)
             .class(toggle_class(on))
@@ -550,14 +547,14 @@ fn transport(state: &Window) -> Element<'_, Message> {
         .on_press(Message::PlayPause);
 
     let (repeat_icon, repeat_tip) = match repeat {
-        Repeat::Off => ("media-playlist-consecutive-symbolic", "Repetir: no"),
-        Repeat::Context => ("media-playlist-repeat-symbolic", "Repetir: todo"),
-        Repeat::Track => ("media-playlist-repeat-song-symbolic", "Repetir: canción"),
+        Repeat::Off => ("media-playlist-consecutive-symbolic", fl!("repeat-off")),
+        Repeat::Context => ("media-playlist-repeat-symbolic", fl!("repeat-all")),
+        Repeat::Track => ("media-playlist-repeat-song-symbolic", fl!("repeat-track")),
     };
     let shuffle_tip = if shuffle {
-        "Aleatorio: sí"
+        fl!("shuffle-on")
     } else {
-        "Aleatorio: no"
+        fl!("shuffle-off")
     };
 
     let volume = state.volume();
@@ -572,7 +569,7 @@ fn transport(state: &Window) -> Element<'_, Message> {
         .align_y(Alignment::Center)
         .push(
             button::icon(icon::from_name(volume_icon))
-                .tooltip("Silenciar")
+                .tooltip(fl!("mute"))
                 .on_press_maybe(volume.map(|_| Message::ToggleMute)),
         )
         .push(
@@ -590,13 +587,13 @@ fn transport(state: &Window) -> Element<'_, Message> {
         ))
         .push(small(
             "media-skip-backward-symbolic",
-            "Anterior",
+            fl!("previous"),
             Message::Previous,
         ))
         .push(play)
         .push(small(
             "media-skip-forward-symbolic",
-            "Siguiente",
+            fl!("next"),
             Message::Next,
         ))
         .push(mode(
@@ -621,9 +618,9 @@ fn save_button(saved: bool) -> Element<'static, Message> {
     tooltip(
         button,
         text::body(if saved {
-            "Quitar de tu biblioteca"
+            fl!("library-remove")
         } else {
-            "Guardar en tu biblioteca"
+            fl!("library-save")
         }),
         tooltip::Position::Top,
     )
@@ -661,7 +658,7 @@ fn toggle_look(theme: &cosmic::Theme, focused: bool, on: bool, press: Press) -> 
     style
 }
 
-fn placeholder_text(message: &str) -> Element<'_, Message> {
+fn placeholder_text<'a>(message: String) -> Element<'a, Message> {
     container(text::body(message).class(DIM).align_x(Alignment::Center))
         .padding([24, 16])
         .center_x(Length::Fill)
@@ -674,8 +671,8 @@ fn library(state: &Window) -> Element<'_, Message> {
 
     if let Some(detail) = &library.detail {
         let (title, playable) = match &detail.source {
-            Source::Liked => ("Tus me gusta", matches!(detail.items, Load::Ready(_))),
-            Source::Entry(entry) => (entry.name.as_str(), true),
+            Source::Liked => (fl!("liked-songs"), matches!(detail.items, Load::Ready(_))),
+            Source::Entry(entry) => (entry.name.clone(), true),
         };
         column = column.push(
             Row::new()
@@ -683,12 +680,12 @@ fn library(state: &Window) -> Element<'_, Message> {
                 .align_y(Alignment::Center)
                 .push(
                     button::icon(icon::from_name("go-previous-symbolic"))
-                        .tooltip("Volver")
+                        .tooltip(fl!("back"))
                         .on_press(Message::Browse(Browse::CloseDetail)),
                 )
                 .push(one_line(text::heading(title)).width(Length::Fill))
                 .push(
-                    button::suggested("Reproducir")
+                    button::suggested(fl!("play"))
                         .leading_icon(icon::from_name("media-playback-start-symbolic"))
                         .on_press_maybe(playable.then_some(Message::Browse(Browse::PlayDetail))),
                 ),
@@ -707,7 +704,7 @@ fn library(state: &Window) -> Element<'_, Message> {
         );
         if library.tab == Tab::Search {
             column = column.push(
-                text_input::search_input("Buscar en Spotify", library.query.as_str())
+                text_input::search_input(fl!("search-placeholder"), library.query.as_str())
                     .on_input(|query| Message::Browse(Browse::Query(query)))
                     .on_submit(|_| Message::Browse(Browse::SubmitSearch))
                     .on_clear(Message::Browse(Browse::ClearSearch)),
@@ -733,20 +730,20 @@ fn library(state: &Window) -> Element<'_, Message> {
 fn list_body(state: &Window) -> Element<'_, Message> {
     let library = &state.library;
     if let Some(detail) = &library.detail {
-        return entries_or(state, &detail.items, "Esta lista está vacía.", None, false);
+        return entries_or(state, &detail.items, fl!("empty-list"), None, false);
     }
     match library.tab {
         Tab::Search if library.query.trim().is_empty() => entries_or(
             state,
             &library.recent,
-            "Todavía no escuchaste nada. Buscá algo para empezar.",
-            Some(section_title("Escuchado recientemente")),
+            fl!("empty-recent"),
+            Some(section_title(fl!("recently-played"))),
             false,
         ),
         Tab::Search => match &library.results {
-            Load::Idle | Load::Loading => placeholder_text("Buscando…"),
+            Load::Idle | Load::Loading => placeholder_text(fl!("searching")),
             Load::Failed(error) => placeholder_error(error),
-            Load::Ready(groups) if groups.is_empty() => placeholder_text("Sin resultados."),
+            Load::Ready(groups) if groups.is_empty() => placeholder_text(fl!("no-results")),
             Load::Ready(groups) => {
                 let mut column = Column::new().spacing(2);
                 for group in groups {
@@ -758,39 +755,27 @@ fn list_body(state: &Window) -> Element<'_, Message> {
                 column.into()
             }
         },
-        Tab::Queue => entries_or(
-            state,
-            &library.queue,
-            "La cola está vacía. Agregá un tema con +.",
-            None,
-            true,
-        ),
+        Tab::Queue => entries_or(state, &library.queue, fl!("empty-queue"), None, true),
         Tab::Playlists => entries_or(
             state,
             &library.playlists,
-            "Todavía no tenés playlists.",
+            fl!("empty-playlists"),
             Some(liked_row(library.liked_count)),
             false,
         ),
-        Tab::Podcasts => entries_or(
-            state,
-            &library.shows,
-            "No seguís ningún podcast. Buscá uno y seguilo en Spotify.",
-            None,
-            false,
-        ),
+        Tab::Podcasts => entries_or(state, &library.shows, fl!("empty-podcasts"), None, false),
     }
 }
 
 fn entries_or<'a>(
     state: &'a Window,
     load: &'a Load<Vec<Entry>>,
-    empty: &'a str,
+    empty: String,
     header: Option<Element<'a, Message>>,
     removable: bool,
 ) -> Element<'a, Message> {
     match load {
-        Load::Idle | Load::Loading => placeholder_text("Cargando…"),
+        Load::Idle | Load::Loading => placeholder_text(fl!("status-loading")),
         Load::Failed(error) => placeholder_error(error),
         Load::Ready(list) => {
             let mut column = Column::new().spacing(2);
@@ -816,22 +801,22 @@ fn placeholder_error(error: &str) -> Element<'_, Message> {
         .into()
 }
 
-fn section_title(title: &str) -> Element<'_, Message> {
+fn section_title<'a>(title: String) -> Element<'a, Message> {
     container(text::caption_heading(title).class(DIM))
         .padding([8, 8, 4, 8])
         .into()
 }
 
-fn group_title(kind: EntryKind) -> &'static str {
+fn group_title(kind: EntryKind) -> String {
     match kind {
-        EntryKind::Track => "Canciones",
-        EntryKind::Artist => "Artistas",
-        EntryKind::Album => "Álbumes",
-        EntryKind::Playlist => "Playlists",
-        EntryKind::Show => "Podcasts",
-        EntryKind::Episode => "Episodios",
-        EntryKind::Chapter => "Capítulos",
-        EntryKind::Audiobook => "Audiolibros",
+        EntryKind::Track => fl!("group-tracks"),
+        EntryKind::Artist => fl!("group-artists"),
+        EntryKind::Album => fl!("group-albums"),
+        EntryKind::Playlist => fl!("group-playlists"),
+        EntryKind::Show => fl!("group-podcasts"),
+        EntryKind::Episode => fl!("group-episodes"),
+        EntryKind::Chapter => fl!("group-chapters"),
+        EntryKind::Audiobook => fl!("group-audiobooks"),
     }
 }
 
@@ -931,7 +916,7 @@ fn entry_row<'a>(
     let action = if let Some(index) = remove_at {
         button::icon(icon::from_name("list-remove-symbolic"))
             .extra_small()
-            .tooltip("Sacar de la cola")
+            .tooltip(fl!("queue-remove"))
             .on_press(Message::Browse(Browse::Dequeue(index)))
     } else if entry.kind.is_item() {
         let queued = state.library.queued.contains(&entry.uri);
@@ -942,15 +927,15 @@ fn entry_row<'a>(
         }))
         .extra_small()
         .tooltip(if queued {
-            "En la cola"
+            fl!("queue-added")
         } else {
-            "Agregar a la cola"
+            fl!("queue-add")
         })
         .on_press(Message::Browse(Browse::Queue(entry.clone())))
     } else {
         button::icon(icon::from_name("media-playback-start-symbolic"))
             .extra_small()
-            .tooltip("Reproducir")
+            .tooltip(fl!("play"))
             .on_press(Message::Browse(Browse::PlayContext(entry.clone())))
     };
 
@@ -964,9 +949,9 @@ fn entry_row<'a>(
 
 fn liked_row<'a>(count: u64) -> Element<'a, Message> {
     let detail = if count > 0 {
-        format!("Playlist  ·  {count} canciones")
+        fl!("liked-detail", count = count)
     } else {
-        "Playlist".to_owned()
+        fl!("playlist")
     };
     let art = container(icon::from_name("emblem-favorite-symbolic").size(18))
         .center(ROW_ART)
@@ -990,7 +975,7 @@ fn liked_row<'a>(count: u64) -> Element<'a, Message> {
             Column::new()
                 .spacing(1)
                 .width(Length::Fill)
-                .push(one_line(text::body("Tus me gusta")))
+                .push(one_line(text::body(fl!("liked-songs"))))
                 .push(one_line(text::caption(detail)).class(DIM)),
         )
         .push(icon::from_name("go-next-symbolic").size(16));
@@ -1007,29 +992,23 @@ fn liked_row<'a>(count: u64) -> Element<'a, Message> {
 fn setup_view(state: &Window) -> Element<'_, Message> {
     let reauth = state.session == Session::NeedsReauth;
     let status = if reauth {
-        "Sesión vencida"
+        fl!("session-expired")
     } else {
-        "Sin conectar"
+        fl!("signed-out")
     };
 
     let (title, lead) = if reauth {
-        (
-            "Tu sesión de Spotify venció",
-            "Spotify limita cada inicio de sesión a seis meses. Conectate de nuevo y todo sigue como estaba.",
-        )
+        (fl!("reauth-title"), fl!("reauth-lead"))
     } else {
-        (
-            "Conectá tu cuenta de Spotify",
-            "Pegá el Client ID de tu app de Spotify y tocá Conectar. Necesitás Spotify Premium.",
-        )
+        (fl!("setup-title"), fl!("setup-lead"))
     };
 
     let connect_row: Element<'_, Message> = if state.is_connecting() {
         Row::new()
             .spacing(8)
             .align_y(Alignment::Center)
-            .push(text::body("Esperando que apruebes en el navegador…").width(Length::Fill))
-            .push(button::standard("Cancelar").on_press(Message::CancelConnect))
+            .push(text::body(fl!("waiting-browser-approval")).width(Length::Fill))
+            .push(button::standard(fl!("cancel")).on_press(Message::CancelConnect))
             .into()
     } else {
         let can_connect = !state.client_id_draft.trim().is_empty();
@@ -1043,7 +1022,7 @@ fn setup_view(state: &Window) -> Element<'_, Message> {
                     .width(Length::Fill),
             )
             .push(
-                button::suggested("Conectar")
+                button::suggested(fl!("connect"))
                     .on_press_maybe(can_connect.then_some(Message::Connect)),
             )
             .into()
@@ -1102,21 +1081,22 @@ fn instructions(state: &Window) -> Element<'_, Message> {
         )
         .push(
             button::icon(icon::from_name(copy_icon))
-                .tooltip(if state.copied { "Copiado" } else { "Copiar" })
+                .tooltip(if state.copied {
+                    fl!("copied")
+                } else {
+                    fl!("copy")
+                })
                 .on_press(Message::CopyRedirectUri),
         );
 
     Column::new()
         .spacing(12)
-        .push(text::heading("Cómo obtener tu Client ID"))
+        .push(text::heading(fl!("howto-title")))
         .push(step(
             "1",
             Column::new()
                 .spacing(2)
-                .push(
-                    text::body("Creá una app en el panel de desarrolladores de Spotify.")
-                        .class(DIM),
-                )
+                .push(text::body(fl!("howto-step-app")).class(DIM))
                 .push(
                     button::link("developer.spotify.com/dashboard")
                         .trailing_icon(true)
@@ -1127,14 +1107,11 @@ fn instructions(state: &Window) -> Element<'_, Message> {
             "2",
             Column::new()
                 .spacing(6)
-                .push(text::body("En Redirect URIs agregá exactamente:").class(DIM))
+                .push(text::body(fl!("howto-step-redirect")).class(DIM))
                 .push(redirect)
-                .push(text::body("Marcá Web API y guardá los cambios.").class(DIM)),
+                .push(text::body(fl!("howto-step-web-api")).class(DIM)),
         ))
-        .push(step(
-            "3",
-            text::body("Copiá el Client ID de la app, pegalo arriba y tocá Conectar.").class(DIM),
-        ))
+        .push(step("3", text::body(fl!("howto-step-paste")).class(DIM)))
         .into()
 }
 
@@ -1143,7 +1120,7 @@ fn instructions(state: &Window) -> Element<'_, Message> {
 /// `button::destructive` & co. wrap their label when the row is tight, so the
 /// label is built by hand to keep it on one line and let the text beside it give way.
 fn nowrap_button<'a>(
-    label: &'static str,
+    label: String,
     class: theme::Button,
     message: Message,
 ) -> Element<'a, Message> {
@@ -1157,7 +1134,7 @@ fn nowrap_button<'a>(
 
 fn account_row<'a>(
     title: String,
-    label: &'static str,
+    label: String,
     class: theme::Button,
     message: Message,
 ) -> Element<'a, Message> {
@@ -1171,26 +1148,28 @@ fn account_row<'a>(
 fn playback_row(state: &Window) -> Element<'_, Message> {
     match state.playback {
         Playback::Ready => account_row(
-            format!("Vinculada como «{}»", state.device_name),
-            "Desvincular",
+            fl!("playback-linked-as", device = state.device_name.as_str()),
+            fl!("playback-unlink"),
             theme::Button::Standard,
             Message::DisablePlayback,
         ),
         Playback::NeedsLogin => account_row(
-            "Sin vincular".to_owned(),
-            "Vincular",
+            fl!("playback-not-linked"),
+            fl!("playback-link"),
             theme::Button::Suggested,
             Message::EnablePlayback,
         ),
         Playback::Authorizing => account_row(
-            "Esperando al navegador…".to_owned(),
-            "Cancelar",
+            fl!("waiting-browser"),
+            fl!("cancel"),
             theme::Button::Standard,
             Message::CancelPlayback,
         ),
-        Playback::Missing => {
-            settings::item("No instalada", text::caption("just install").class(DIM)).into()
-        }
+        Playback::Missing => settings::item(
+            fl!("playback-not-installed"),
+            text::caption("just install").class(DIM),
+        )
+        .into(),
     }
 }
 
@@ -1198,26 +1177,26 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
     let account: Element<'_, Message> = match &state.session {
         Session::Connected(user) => {
             let who = if user.name.is_empty() {
-                "tu cuenta".to_owned()
+                fl!("your-account")
             } else {
                 user.name.clone()
             };
             account_row(
-                format!("Conectado como {who}"),
-                "Cerrar sesión",
+                fl!("signed-in-as", name = who),
+                fl!("sign-out"),
                 theme::Button::Suggested,
                 Message::Logout,
             )
         }
         Session::NeedsReauth => account_row(
-            "Sesión vencida".to_owned(),
-            "Reconectar",
+            fl!("session-expired"),
+            fl!("reconnect"),
             theme::Button::Suggested,
             Message::ShowPlayer,
         ),
         Session::SignedOut => account_row(
-            "Sin conectar".to_owned(),
-            "Conectar",
+            fl!("signed-out"),
+            fl!("connect"),
             theme::Button::Suggested,
             Message::ShowPlayer,
         ),
@@ -1229,17 +1208,16 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
         mask(&state.config.client_id)
     };
 
-    let mut panel = settings::section().title("Panel").add(settings::item(
-        "Mostrar en la barra",
-        toggler(state.config.show_track).on_toggle(Message::SetShowTrack),
-    ));
+    let mut panel = settings::section()
+        .title(fl!("settings-panel"))
+        .add(settings::item(
+            fl!("settings-show-in-bar"),
+            toggler(state.config.show_track).on_toggle(Message::SetShowTrack),
+        ));
     if state.config.show_track {
-        let labels: Vec<String> = PanelLook::ALL
-            .iter()
-            .map(|look| look.label().to_owned())
-            .collect();
+        let labels: Vec<String> = PanelLook::ALL.iter().map(|look| look.label()).collect();
         panel = panel.add(settings::item(
-            "Estilo",
+            fl!("settings-style"),
             dropdown(labels, Some(state.config.panel_look.index()), |index| {
                 Message::SetPanelLook(PanelLook::ALL[index])
             })
@@ -1250,13 +1228,13 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
     let mut column = Column::new()
         .spacing(14)
         .push(header(
-            one_line(text::caption("Configuración")).class(DIM).into(),
+            one_line(text::caption(fl!("settings"))).class(DIM).into(),
             None,
         ))
         .push(divider::horizontal::default())
         .push(
             settings::section()
-                .title("Cuenta")
+                .title(fl!("settings-account"))
                 .add(account)
                 .add(settings::item(
                     "Client ID",
@@ -1266,7 +1244,7 @@ fn settings_view(state: &Window) -> Element<'_, Message> {
     if matches!(state.session, Session::Connected(_)) {
         column = column.push(
             settings::section()
-                .title("Reproducción en esta compu")
+                .title(fl!("settings-playback"))
                 .add(playback_row(state)),
         );
     }

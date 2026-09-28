@@ -1049,44 +1049,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-ext-applet-spotify"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "image",
- "libc",
- "libcosmic",
- "open",
- "rand 0.10.3",
- "reqwest 0.13.5",
- "rustls 0.23.45",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "cosmic-ext-spotify-player"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "libc",
- "libpulse-binding",
- "libpulse-simple-binding",
- "librespot-connect",
- "librespot-core",
- "librespot-oauth",
- "librespot-playback",
- "log",
- "rustfft",
- "sha2 0.11.0",
- "tokio",
-]
-
-[[package]]
 name = "cosmic-freedesktop-icons"
 version = "0.4.0"
 source = "git+https://github.com/pop-os/freedesktop-icons#ab4c57b8e416c6af9297cb04d101889896fd9a92"
@@ -6109,6 +6071,47 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "spotypop"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "image",
+ "libc",
+ "libcosmic",
+ "open",
+ "rand 0.10.3",
+ "reqwest 0.13.5",
+ "rust-embed",
+ "rustls 0.23.45",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
+name = "spotypop-player"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "libc",
+ "libpulse-binding",
+ "libpulse-simple-binding",
+ "librespot-connect",
+ "librespot-core",
+ "librespot-oauth",
+ "librespot-playback",
+ "log",
+ "rustfft",
+ "sha2 0.11.0",
+ "tokio",
 ]
 
 [[package]]

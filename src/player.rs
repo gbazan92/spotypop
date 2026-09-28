@@ -1,4 +1,4 @@
-//! The local receiver (`cosmic-ext-spotify-player`): finding it, authorizing
+//! The local receiver (`spotypop-player`): finding it, authorizing
 //! it once, and keeping one instance running outside the panel's lifetime.
 //! Paths mirror `player/src/paths.rs`.
 
@@ -10,8 +10,10 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-pub const BINARY: &str = "cosmic-ext-spotify-player";
-const APP_DIR: &str = "cosmic-ext-applet-spotify";
+use crate::fl;
+
+pub const BINARY: &str = "spotypop-player";
+const APP_DIR: &str = "spotypop";
 /// Exit code of `run` and `login` when the computer has no playback login.
 const NEEDS_LOGIN: i32 = 3;
 
@@ -99,7 +101,7 @@ fn log_file(name: &str) -> Option<fs::File> {
 /// Starts the receiver in its own session so a panel restart does not take
 /// the music with it. A second instance notices the first and exits.
 pub fn start() -> Result<(), String> {
-    let binary = binary().ok_or_else(|| format!("no se encontró {BINARY}"))?;
+    let binary = binary().ok_or_else(|| fl!("player-not-found", binary = BINARY))?;
     let stderr = log_file("player.log").map_or_else(Stdio::null, Stdio::from);
     let mut command = Command::new(binary);
     command
@@ -120,7 +122,7 @@ pub fn start() -> Result<(), String> {
     }
     let mut child = command
         .spawn()
-        .map_err(|error| format!("no se pudo iniciar el reproductor: {error}"))?;
+        .map_err(|error| fl!("player-start-failed", error = error.to_string()))?;
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -170,7 +172,7 @@ pub fn forget() {
 /// Output goes to a file, never a pipe: the browser it launches inherits the
 /// descriptors and would hold a pipe open long after the login is done.
 pub async fn login(token: Option<String>) -> Result<(), String> {
-    let binary = binary().ok_or_else(|| format!("no se encontró {BINARY}"))?;
+    let binary = binary().ok_or_else(|| fl!("player-not-found", binary = BINARY))?;
     let log_path = state_dir().join("player-login.log");
     let stderr = log_file("player-login.log").map_or_else(Stdio::null, Stdio::from);
     let mut command = tokio::process::Command::new(binary);
@@ -195,21 +197,21 @@ pub async fn login(token: Option<String>) -> Result<(), String> {
     let status = command
         .status()
         .await
-        .map_err(|error| format!("no se pudo iniciar el reproductor: {error}"))?;
+        .map_err(|error| fl!("player-start-failed", error = error.to_string()))?;
     if status.success() {
         return Ok(());
     }
     if status.code() == Some(NEEDS_LOGIN) {
-        return Err("Spotify no autorizó esta compu.".into());
+        return Err(fl!("player-not-authorized"));
     }
     let detail = fs::read_to_string(log_path).unwrap_or_default();
     let last = detail.lines().rev().find(|line| !line.trim().is_empty());
     Err(match last {
-        Some(line) => format!(
-            "La autorización falló: {}",
-            line.chars().take(160).collect::<String>()
+        Some(line) => fl!(
+            "player-auth-failed",
+            reason = line.chars().take(160).collect::<String>()
         ),
-        None => "La autorización no se completó.".into(),
+        None => fl!("player-auth-incomplete"),
     })
 }
 

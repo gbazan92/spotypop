@@ -66,7 +66,7 @@ impl Store {
                     .filter(|path| path.is_absolute())
                     .map(|home| home.join(".local/state"))
             })
-            .ok_or_else(|| Error::Storage("no se encontró el directorio de estado".into()))?;
+            .ok_or_else(|| Error::Storage("no state directory found".into()))?;
         Ok(Self::at(base.join(app)))
     }
 
@@ -136,10 +136,10 @@ fn unsafe_path(path: &Path, why: &str) -> Error {
 
 fn check_dir(path: &Path, meta: &fs::Metadata) -> Result<(), Error> {
     if meta.file_type().is_symlink() || !meta.is_dir() {
-        return Err(unsafe_path(path, "no es un directorio real"));
+        return Err(unsafe_path(path, "is not a real directory"));
     }
     if meta.uid() != euid() {
-        return Err(unsafe_path(path, "pertenece a otro usuario"));
+        return Err(unsafe_path(path, "belongs to another user"));
     }
     Ok(())
 }
@@ -155,35 +155,35 @@ fn read_private(path: &Path) -> Result<Option<Vec<u8>>, Error> {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(unsafe_path(path, "es un enlace simbólico"));
+            return Err(unsafe_path(path, "is a symbolic link"));
         }
         Err(error) => return Err(storage(path, &error)),
     };
     let meta = file.metadata().map_err(|error| storage(path, &error))?;
     if !meta.is_file() {
-        return Err(unsafe_path(path, "no es un archivo regular"));
+        return Err(unsafe_path(path, "is not a regular file"));
     }
     if meta.uid() != euid() {
-        return Err(unsafe_path(path, "pertenece a otro usuario"));
+        return Err(unsafe_path(path, "belongs to another user"));
     }
     if meta.nlink() != 1 {
-        return Err(unsafe_path(path, "tiene más de un enlace"));
+        return Err(unsafe_path(path, "has more than one link"));
     }
     if meta.mode() & 0o077 != 0 {
         return Err(unsafe_path(
             path,
-            "es accesible para otros usuarios (usá chmod 600)",
+            "is readable by other users (run chmod 600)",
         ));
     }
     if meta.len() > AUTH_MAX_BYTES {
-        return Err(unsafe_path(path, "es demasiado grande"));
+        return Err(unsafe_path(path, "is too large"));
     }
     let mut blob = Vec::new();
     file.take(AUTH_MAX_BYTES + 1)
         .read_to_end(&mut blob)
         .map_err(|error| storage(path, &error))?;
     if blob.len() as u64 > AUTH_MAX_BYTES {
-        return Err(unsafe_path(path, "es demasiado grande"));
+        return Err(unsafe_path(path, "is too large"));
     }
     Ok(Some(blob))
 }
@@ -197,7 +197,7 @@ fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> Result<(), Error> {
     {
         return Err(unsafe_path(
             &target,
-            "no es un archivo propio; no se reemplaza",
+            "is not our own file; leaving it alone",
         ));
     }
 

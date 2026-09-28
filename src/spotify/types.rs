@@ -301,7 +301,7 @@ pub fn check_id(value: &str) -> Result<&str, Error> {
         Ok(value)
     } else {
         Err(Error::BadArgument(format!(
-            "ID de Spotify inválido: {value:.40}"
+            "invalid Spotify ID: {value:.40}"
         )))
     }
 }
@@ -323,7 +323,7 @@ pub fn check_uri(value: &str) -> Result<&str, Error> {
         Ok(value)
     } else {
         Err(Error::BadArgument(format!(
-            "URI de Spotify inválida: {value:.60}"
+            "invalid Spotify URI: {value:.60}"
         )))
     }
 }

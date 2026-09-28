@@ -1,9 +1,9 @@
 [package]
-name = "cosmic-ext-spotify-player"
+name = "spotypop-player"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0"
-description = "Local Spotify Connect receiver for cosmic-ext-applet-spotify"
+description = "Local Spotify Connect receiver for SpotyPop"
 
 # Pinned to the librespot fork used by omarchy-spotify-client: it smooths manual
 # track switches (librespot PR #1740) and stops cleanly when Spotify refuses an

@@ -81,7 +81,7 @@ fn cache_dir() -> PathBuf {
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("cosmic-ext-applet-spotify").join("covers")
+    base.join("spotypop").join("covers")
 }
 
 fn scaled(image: &image::DynamicImage, size: u32, fast: bool) -> Handle {

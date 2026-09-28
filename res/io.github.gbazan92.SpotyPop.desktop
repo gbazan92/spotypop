@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=SpotyPop
+Comment=A Spotify mini player for the COSMIC panel
+Comment[es]=Mini reproductor de Spotify para el panel de COSMIC
+Exec=spotypop
+Terminal=false
+Type=Application
+Icon=io.github.gbazan92.SpotyPop-symbolic
+Categories=AudioVideo;Audio;Player;
+Keywords=spotify;music;player;
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto

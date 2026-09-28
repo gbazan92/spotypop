@@ -5,6 +5,7 @@
 use serde_json::Value;
 
 use super::types::pick_url;
+use crate::fl;
 
 /// List thumbnails; the smallest Spotify image is 64 px.
 const THUMB_SIZE: u32 = 64;
@@ -200,11 +201,11 @@ pub fn entry(value: &Value, parent: Option<&Value>) -> Option<Entry> {
         EntryKind::Album => {
             let year = str_of(value, "release_date").get(..4).unwrap_or_default();
             (
-                join(&["Álbum", &names(value, "artists"), year]),
+                join(&[&fl!("kind-album"), &names(value, "artists"), year]),
                 images(value),
             )
         }
-        EntryKind::Artist => ("Artista".to_owned(), images(value)),
+        EntryKind::Artist => (fl!("kind-artist"), images(value)),
         EntryKind::Playlist => {
             let owner = obj(value, "owner").map_or("", |owner| {
                 let name = str_of(owner, "display_name");
@@ -219,18 +220,18 @@ pub fn entry(value: &Value, parent: Option<&Value>) -> Option<Entry> {
                 .or_else(|| obj(value, "tracks"))
                 .map_or(0, |counter| count(counter, "total"));
             let total = if total > 0 {
-                format!("{total} canciones")
+                fl!("track-count", count = total)
             } else {
                 String::new()
             };
-            (join(&["Playlist", owner, &total]), images(value))
+            (join(&[&fl!("playlist"), owner, &total]), images(value))
         }
         EntryKind::Show => (
-            join(&["Podcast", str_of(value, "publisher")]),
+            join(&[&fl!("kind-podcast"), str_of(value, "publisher")]),
             images(value),
         ),
         EntryKind::Audiobook => (
-            join(&["Audiolibro", &names(value, "authors")]),
+            join(&[&fl!("kind-audiobook"), &names(value, "authors")]),
             images(value),
         ),
     };
@@ -342,7 +343,7 @@ mod tests {
             "owner": {"id": "me", "display_name": ""}, "items": {"total": 12}});
         assert_eq!(
             entry(&raw, None).unwrap().detail,
-            "Playlist  ·  me  ·  12 canciones"
+            "Playlist  ·  me  ·  12 songs"
         );
     }
 

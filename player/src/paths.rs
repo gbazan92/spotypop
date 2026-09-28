@@ -3,7 +3,7 @@
 use std::env;
 use std::path::PathBuf;
 
-const APP_DIR: &str = "cosmic-ext-applet-spotify";
+const APP_DIR: &str = "spotypop";
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     env::var_os(var)

@@ -10,9 +10,9 @@ pub const ERROR_MAX_BYTES: usize = 64 * 1024;
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 const USER_AGENT: &str = concat!(
-    "cosmic-ext-applet-spotify/",
+    "spotypop/",
     env!("CARGO_PKG_VERSION"),
-    " (+https://github.com/gbazan92/cosmic-ext-applet-spotify)"
+    " (+https://github.com/gbazan92/spotypop)"
 );
 
 #[derive(Clone, Debug)]

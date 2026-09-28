@@ -11,6 +11,7 @@ use url::Url;
 
 use super::http::{self, Http};
 use super::{Error, StoredAuth};
+use crate::fl;
 
 const ACCOUNTS: &str = "https://accounts.spotify.com";
 
@@ -253,7 +254,7 @@ pub async fn finish_login(http: &Http, pending: PendingLogin) -> Result<StoredAu
     tokens.apply(&mut auth);
     if auth.refresh_token.is_empty() {
         return Err(Error::LoginDenied(
-            "Spotify no devolvió un refresh token".into(),
+            "Spotify returned no refresh token".into(),
         ));
     }
     Ok(auth)
@@ -293,35 +294,23 @@ async fn serve(mut stream: TcpStream, state: &str) -> Option<Result<String, Erro
         .unwrap_or_default();
 
     let (status, body, outcome) = match parse_callback(target, state) {
-        Callback::NotFound => ("404 Not Found", "No encontrado.".to_owned(), None),
-        Callback::Ignored => (
-            "200 OK",
-            "Esta respuesta no corresponde a este inicio de sesión. Probá conectar de nuevo."
-                .to_owned(),
-            None,
-        ),
+        Callback::NotFound => ("404 Not Found", fl!("login-page-not-found"), None),
+        Callback::Ignored => ("200 OK", fl!("login-page-ignored"), None),
         Callback::Denied(reason) => (
             "200 OK",
-            format!(
-                "Spotify informó: {}. Podés cerrar esta pestaña.",
-                escape_html(&reason)
-            ),
+            fl!("login-page-denied", reason = escape_html(&reason)),
             Some(Err(Error::LoginDenied(reason))),
         ),
         Callback::Malformed => (
             "200 OK",
-            "La respuesta de Spotify llegó mal formada. Probá conectar de nuevo.".to_owned(),
-            Some(Err(Error::LoginDenied("código mal formado".into()))),
+            fl!("login-page-malformed"),
+            Some(Err(Error::LoginDenied("malformed code".into()))),
         ),
-        Callback::Code(code) => (
-            "200 OK",
-            "Conectado a Spotify. Podés cerrar esta pestaña y volver al panel.".to_owned(),
-            Some(Ok(code)),
-        ),
+        Callback::Code(code) => ("200 OK", fl!("login-page-done"), Some(Ok(code))),
     };
 
     let page = format!(
-        "<!doctype html><meta charset=utf-8><title>COSMIC Spotify</title>\
+        "<!doctype html><meta charset=utf-8><title>SpotyPop</title>\
          <body style=\"font-family:sans-serif;background:#1b1b1b;color:#e0e0e0;display:flex;\
          align-items:center;justify-content:center;height:100vh;margin:0\">\
          <div style=\"text-align:center\"><div style=\"font-size:48px\">&#9835;</div><p>{body}</p></div></body>"

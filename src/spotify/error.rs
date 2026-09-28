@@ -2,6 +2,8 @@ use std::fmt;
 
 use serde::Deserialize;
 
+use crate::fl;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     SignedOut,
@@ -26,39 +28,35 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SignedOut => f.write_str("No estás conectado a Spotify."),
-            Self::Reauth => f.write_str("Tu sesión de Spotify venció. Conectate de nuevo."),
-            Self::NoClientId => f.write_str("Falta el Client ID de tu app de Spotify."),
-            Self::NoDevice => f.write_str("No hay ningún dispositivo de Spotify activo."),
-            Self::PremiumRequired => {
-                f.write_str("Spotify Premium es necesario para controlar la reproducción.")
+        let text = match self {
+            Self::SignedOut => fl!("error-signed-out"),
+            Self::Reauth => fl!("error-reauth"),
+            Self::NoClientId => fl!("error-no-client-id"),
+            Self::NoDevice => fl!("error-no-device"),
+            Self::PremiumRequired => fl!("error-premium"),
+            Self::RateLimited { retry_after } => {
+                fl!("error-rate-limited", seconds = (*retry_after).max(1))
             }
-            Self::RateLimited { retry_after } => write!(
-                f,
-                "Demasiadas solicitudes a Spotify. Reintentá en {}s.",
-                (*retry_after).max(1)
-            ),
-            Self::Forbidden(message) => write!(f, "Spotify rechazó la solicitud: {message}"),
-            Self::NotFound(message) => write!(f, "No encontrado: {message}"),
-            Self::Server(message) => write!(f, "Error del servidor de Spotify: {message}"),
+            Self::Forbidden(message) => fl!("error-forbidden", message = message.as_str()),
+            Self::NotFound(message) => fl!("error-not-found", message = message.as_str()),
+            Self::Server(message) => fl!("error-server", message = message.as_str()),
             Self::Http { status, message } => {
-                write!(f, "Spotify respondió HTTP {status}: {message}")
+                fl!(
+                    "error-http",
+                    status = status.to_string(),
+                    message = message.as_str()
+                )
             }
-            Self::Network(message) => write!(f, "No se pudo contactar a Spotify: {message}"),
-            Self::TooLarge => f.write_str("Spotify envió una respuesta demasiado grande."),
-            Self::BadArgument(message) => write!(f, "Dato inválido: {message}"),
-            Self::PortBusy(port) => write!(
-                f,
-                "El puerto {port} está ocupado. Elegí otro puerto de redirección."
-            ),
-            Self::LoginTimeout => {
-                f.write_str("Se agotó el tiempo esperando la respuesta de Spotify.")
-            }
-            Self::LoginDenied(reason) => write!(f, "El inicio de sesión falló: {reason}"),
-            Self::Browser(message) => write!(f, "No se pudo abrir el navegador: {message}"),
-            Self::Storage(message) => write!(f, "No se pudo guardar la sesión: {message}"),
-        }
+            Self::Network(message) => fl!("error-network", message = message.as_str()),
+            Self::TooLarge => fl!("error-too-large"),
+            Self::BadArgument(message) => fl!("error-bad-argument", message = message.as_str()),
+            Self::PortBusy(port) => fl!("error-port-busy", port = port.to_string()),
+            Self::LoginTimeout => fl!("error-login-timeout"),
+            Self::LoginDenied(reason) => fl!("error-login-denied", reason = reason.as_str()),
+            Self::Browser(message) => fl!("error-browser", message = message.as_str()),
+            Self::Storage(message) => fl!("error-storage", message = message.as_str()),
+        };
+        f.write_str(&text)
     }
 }
 
@@ -113,16 +111,16 @@ impl Error {
             403 if reason == "PREMIUM_REQUIRED" || lower.contains("premium") => {
                 Self::PremiumRequired
             }
-            403 => Self::Forbidden(or("acceso denegado")),
+            403 => Self::Forbidden(or("access denied")),
             404 if reason == "NO_ACTIVE_DEVICE" || lower.contains("device") => Self::NoDevice,
-            404 => Self::NotFound(or("recurso inexistente")),
+            404 => Self::NotFound(or("no such resource")),
             429 => Self::RateLimited {
                 retry_after: retry_after.unwrap_or(1),
             },
             500..=599 => Self::Server(or(&format!("HTTP {status}"))),
             _ => Self::Http {
                 status,
-                message: or("solicitud fallida"),
+                message: or("request failed"),
             },
         }
     }

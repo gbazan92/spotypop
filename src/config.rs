@@ -22,12 +22,12 @@ pub enum PanelLook {
 impl PanelLook {
     pub const ALL: [Self; 4] = [Self::Cover, Self::Bars, Self::Wave, Self::Fill];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> String {
         match self {
-            Self::Cover => "Portada y título",
-            Self::Bars => "Barras",
-            Self::Wave => "Ondas",
-            Self::Fill => "Relleno",
+            Self::Cover => crate::fl!("look-cover"),
+            Self::Bars => crate::fl!("look-bars"),
+            Self::Wave => crate::fl!("look-wave"),
+            Self::Fill => crate::fl!("look-fill"),
         }
     }
 

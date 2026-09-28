@@ -145,10 +145,10 @@ impl Sink for PulseTap {
         };
         let stream = Simple::new(
             None,
-            "Spotify (COSMIC)",
+            "SpotyPop",
             Direction::Playback,
             None,
-            "Música",
+            "Music",
             &spec,
             None,
             Some(&buffer),

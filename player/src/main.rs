@@ -1,4 +1,4 @@
-//! Local Spotify Connect receiver for cosmic-ext-applet-spotify.
+//! Local Spotify Connect receiver for `SpotyPop`.
 //!
 //! `login` authorizes this computer once and stores a reusable librespot
 //! credential; `run` registers a Connect device that plays through
@@ -98,8 +98,7 @@ fn parse_args() -> Result<Action, Failure> {
     let mut args = std::env::args().skip(1);
     let usage = || {
         Failure::Usage(
-            "usage: cosmic-ext-spotify-player run --name <device name> | login [--port <port>]"
-                .into(),
+            "usage: spotypop-player run --name <device name> | login [--port <port>]".into(),
         )
     };
     let command = args.next().ok_or_else(usage)?;
@@ -181,9 +180,7 @@ async fn login(port: u16) -> Result<(), Failure> {
         &format!("http://127.0.0.1:{port}/login"),
         OAUTH_SCOPES.to_vec(),
     )
-    .with_custom_message(
-        "<h2>Listo, esta compu ya puede reproducir Spotify.</h2><p>Podés cerrar esta pestaña.</p>",
-    )
+    .with_custom_message(login_done_page())
     .open_in_browser()
     .build()
     .map_err(|error| Failure::Other(format!("oauth client: {error}")))?;
@@ -203,6 +200,19 @@ async fn login(port: u16) -> Result<(), Failure> {
     session.shutdown();
     println!("playback authorized");
     Ok(())
+}
+
+/// The receiver has no translation catalog; this one page follows the locale.
+fn login_done_page() -> &'static str {
+    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok().filter(|value| !value.is_empty()))
+        .unwrap_or_default();
+    if locale.starts_with("es") {
+        "<h2>Listo, esta computadora ya puede reproducir Spotify.</h2><p>Podés cerrar esta pestaña.</p>"
+    } else {
+        "<h2>Done, this computer can now play Spotify.</h2><p>You can close this tab.</p>"
+    }
 }
 
 /// Held for the life of the receiver so a second `run` exits at once.
@@ -385,7 +395,7 @@ mod tests {
         assert_eq!(id.len(), 40);
         assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_eq!(id, device_id("pop-os (COSMIC)"));
-        assert_ne!(id, device_id("otra"));
+        assert_ne!(id, device_id("other"));
     }
 
     #[test]
