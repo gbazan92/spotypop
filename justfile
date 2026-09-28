@@ -1,28 +1,45 @@
-name := 'cosmic-ext-applet-hola'
-appid := 'io.github.gbazan92.CosmicExtAppletHola'
+name := 'cosmic-ext-applet-spotify'
+player := 'cosmic-ext-spotify-player'
+appid := 'io.github.gbazan92.CosmicExtAppletSpotify'
 
-bin-dst := env('HOME') / '.local/bin' / name
+bin-dir := env('HOME') / '.local/bin'
 desktop-dst := env('HOME') / '.local/share/applications' / appid + '.desktop'
+icon-src := 'res/icons/hicolor/scalable/apps' / appid + '-symbolic.svg'
+icon-dst := env('HOME') / '.local/share/icons/hicolor/scalable/apps' / appid + '-symbolic.svg'
 
 default: build
 
+# The receiver needs the PulseAudio headers (PipeWire serves the same API)
+deps:
+    sudo apt install libpulse-dev
+
 build:
-    cargo build --release
+    cargo build --release --workspace
 
 check:
-    cargo clippy -- -W clippy::pedantic
+    cargo clippy --workspace --all-targets -- -W clippy::pedantic
+
+test:
+    cargo test --workspace
 
 # Installs to ~/.local so the panel can find it (no sudo needed)
 install: build
-    install -Dm0755 target/release/{{name}} {{bin-dst}}
-    sed 's|^Exec=.*|Exec={{bin-dst}}|' res/{{appid}}.desktop | install -Dm0644 /dev/stdin {{desktop-dst}}
+    install -Dm0755 target/release/{{name}} {{bin-dir}}/{{name}}
+    install -Dm0755 target/release/{{player}} {{bin-dir}}/{{player}}
+    sed 's|^Exec=.*|Exec={{bin-dir}}/{{name}}|' res/{{appid}}.desktop | install -Dm0644 /dev/stdin {{desktop-dst}}
+    install -Dm0644 {{icon-src}} {{icon-dst}}
 
 uninstall:
-    rm -f {{bin-dst}} {{desktop-dst}}
+    pkill -x {{player}} || true
+    rm -f {{bin-dir}}/{{name}} {{bin-dir}}/{{player}} {{desktop-dst}} {{icon-dst}}
 
-# Restarts the panel to load the new binary
+# Restarts the panel to load the new binary; the receiver keeps playing
 reload:
     pkill -x cosmic-panel || true
+
+# Restarts the receiver too, after installing a new build of it
+restart-player:
+    pkill -x {{player}} || true
 
 dev: install reload
 

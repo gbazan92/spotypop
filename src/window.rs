@@ -1,23 +1,132 @@
+use std::future::Future;
+use std::time::{Duration, Instant};
+
 use cosmic::app::Core;
+use cosmic::applet::cosmic_panel_config::PanelAnchor;
+use cosmic::applet::token::subscription::{
+    TokenRequest, TokenUpdate, activation_token_subscription,
+};
+use cosmic::cctk::sctk::reexports::calloop::channel::Sender;
+use cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner::{
+    Anchor, Gravity,
+};
+use cosmic::cosmic_config::{self, Config};
+use cosmic::iced::mouse::ScrollDelta;
+use cosmic::iced::task::Handle;
 use cosmic::iced::window::Id;
-use cosmic::iced::{Alignment, Length, Limits};
-use cosmic::surface::action::{app_popup, destroy_popup};
-use cosmic::widget::{Column, button, text};
+use cosmic::iced::{Limits, Subscription, time};
+use cosmic::surface::action::{LiveSettings, app_popup, destroy_popup};
 use cosmic::{Action, Element, Task};
 
-pub const APP_ID: &str = "io.github.gbazan92.CosmicExtAppletHola";
+use crate::art::{self, Artwork};
+use crate::browse::{Browse, Library};
+use crate::config::{self, AppConfig};
+use crate::spotify::{self, Item, PlayerState, Session, Spotify, Store, User};
+use crate::{browser, player, ui};
+
+pub const APP_ID: &str = "io.github.gbazan92.CosmicExtAppletSpotify";
+pub const DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
+const STATE_DIR: &str = "cosmic-ext-applet-spotify";
+
+const VOLUME_STEP: i16 = 5;
+/// Spotify takes a moment before a command shows up in `/me/player`.
+const SETTLE: Duration = Duration::from_millis(700);
+const VOLUME_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Touchpads report pixels; this many make one wheel notch.
+const PIXELS_PER_NOTCH: f32 = 40.0;
+
+/// Marks the activation-token request for the receiver's authorization; URLs
+/// always carry a scheme, so it cannot be mistaken for one.
+const PLAYER_LOGIN: &str = "player-login";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Player,
+    Settings,
+}
+
+/// Whether this computer can play on its own through the local receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Playback {
+    /// The receiver binary is not installed next to the applet.
+    Missing,
+    NeedsLogin,
+    Authorizing,
+    Ready,
+}
 
 pub struct Window {
-    core: Core,
+    pub(crate) core: Core,
     popup: Option<Id>,
-    clicks: u32,
+    pub(crate) view: View,
+    config_handler: Option<Config>,
+    pub(crate) config: AppConfig,
+    pub(crate) client_id_draft: String,
+    spotify: Result<Spotify, spotify::Error>,
+    pub(crate) session: Session,
+    login: Option<Handle>,
+    pub(crate) player: Option<PlayerState>,
+    fetched_at: Instant,
+    pub(crate) loaded: bool,
+    /// The last thing that played, shown dimmed while nothing plays.
+    pub(crate) last_item: Option<Item>,
+    pub(crate) error: Option<String>,
+    pub(crate) saved: Option<bool>,
+    saved_uri: String,
+    pub(crate) artwork: Option<Artwork>,
+    art_pending: Option<String>,
+    pub(crate) seek_drag: Option<f64>,
+    volume_generation: u64,
+    volume_before_mute: Option<u8>,
+    scroll_notches: f32,
+    pub(crate) copied: bool,
+    token_tx: Option<Sender<TokenRequest>>,
+    pub(crate) library: Library,
+    pub(crate) playback: Playback,
+    playback_login: Option<Handle>,
+    pub(crate) device_name: String,
 }
 
 #[derive(Clone, Debug)]
 pub enum Message {
     TogglePopup,
+    OpenSettings,
+    ShowPlayer,
     PopupClosed(Id),
-    Increment,
+    ConfigChanged(AppConfig),
+    Token(TokenUpdate),
+    ClientIdInput(String),
+    Connect,
+    CancelConnect,
+    LoginFinished(Result<User, spotify::Error>),
+    Logout,
+    OpenDashboard,
+    CopyRedirectUri,
+    CopiedReset,
+    SetShowTrack(bool),
+    Poll,
+    Tick,
+    PlayerLoaded(Box<Result<Option<PlayerState>, spotify::Error>>),
+    SavedLoaded(String, Result<bool, spotify::Error>),
+    ArtLoaded(String, Result<Artwork, String>),
+    PlayPause,
+    Next,
+    Previous,
+    ToggleShuffle,
+    CycleRepeat,
+    ToggleSaved,
+    SeekDrag(f64),
+    SeekRelease,
+    SetVolume(u8),
+    VolumeCommit(u64),
+    ToggleMute,
+    Scroll(ScrollDelta),
+    CommandDone(Result<(), spotify::Error>),
+    Browse(Browse),
+    EnablePlayback,
+    CancelPlayback,
+    PlaybackLoginFinished(Result<(), String>),
+    DisablePlayback,
 }
 
 impl cosmic::Application for Window {
@@ -35,43 +144,338 @@ impl cosmic::Application for Window {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<Action<Self::Message>>) {
-        (
-            Self {
-                core,
-                popup: None,
-                clicks: 0,
-            },
-            Task::none(),
-        )
+        let (config_handler, config) = config::load(APP_ID);
+        let spotify = Store::for_app(STATE_DIR).and_then(Spotify::new);
+        let session = spotify
+            .as_ref()
+            .map_or(Session::SignedOut, Spotify::session);
+        let error = spotify.as_ref().err().map(ToString::to_string);
+
+        let mut window = Self {
+            core,
+            popup: None,
+            view: View::Player,
+            config_handler,
+            client_id_draft: config.client_id.clone(),
+            config,
+            spotify,
+            session,
+            login: None,
+            player: None,
+            fetched_at: Instant::now(),
+            loaded: false,
+            last_item: None,
+            error,
+            saved: None,
+            saved_uri: String::new(),
+            artwork: None,
+            art_pending: None,
+            seek_drag: None,
+            volume_generation: 0,
+            volume_before_mute: None,
+            scroll_notches: 0.0,
+            copied: false,
+            token_tx: None,
+            library: Library::default(),
+            playback: Playback::Missing,
+            playback_login: None,
+            device_name: player::device_name(),
+        };
+        window.sync_playback();
+        let task = window.refresh_player();
+        (window, task)
     }
 
     fn on_close_requested(&self, id: Id) -> Option<Message> {
         Some(Message::PopupClosed(id))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn update(&mut self, message: Message) -> Task<Action<Self::Message>> {
         match message {
-            Message::TogglePopup => return self.toggle_popup(),
+            Message::TogglePopup => {
+                if self.popup.is_some() {
+                    return self.close_popup();
+                }
+                self.view = View::Player;
+                self.ensure_receiver();
+                return Task::batch([
+                    self.open_popup(),
+                    self.refresh_player(),
+                    self.ensure_library(),
+                ]);
+            }
+            Message::OpenSettings => {
+                if self.popup.is_none() {
+                    self.view = View::Settings;
+                    return self.open_popup();
+                }
+                if self.view == View::Settings {
+                    return self.close_popup();
+                }
+                self.view = View::Settings;
+            }
+            Message::ShowPlayer => {
+                self.view = View::Player;
+                return self.ensure_library();
+            }
             Message::PopupClosed(id) => {
                 if self.popup == Some(id) {
                     self.popup = None;
+                    self.view = View::Player;
                 }
             }
-            Message::Increment => self.clicks += 1,
+            Message::ConfigChanged(config) => {
+                if config.client_id != self.config.client_id {
+                    self.client_id_draft.clone_from(&config.client_id);
+                }
+                self.config = config;
+            }
+            Message::Token(update) => match update {
+                TokenUpdate::Init(tx) => self.token_tx = Some(tx),
+                TokenUpdate::Finished => self.token_tx = None,
+                TokenUpdate::ActivationToken { token, exec } if exec == PLAYER_LOGIN => {
+                    return self.authorize_playback(token);
+                }
+                TokenUpdate::ActivationToken { token, exec } => {
+                    self.launch(&exec, token.as_deref());
+                }
+            },
+            Message::ClientIdInput(value) => self.client_id_draft = value,
+            Message::Connect => return self.connect(),
+            Message::CancelConnect => {
+                if let Some(handle) = self.login.take() {
+                    handle.abort();
+                }
+            }
+            Message::LoginFinished(result) => {
+                self.login = None;
+                match result {
+                    Ok(user) => {
+                        self.session = Session::Connected(user);
+                        self.error = None;
+                        self.view = View::Player;
+                        self.sync_playback();
+                        // Chains the one-time playback approval right after
+                        // the account one, while the browser is still in front.
+                        let playback = if self.playback == Playback::NeedsLogin {
+                            self.enable_playback()
+                        } else {
+                            Task::none()
+                        };
+                        return Task::batch([
+                            self.refresh_player(),
+                            self.ensure_library(),
+                            playback,
+                        ]);
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                }
+            }
+            Message::Logout => {
+                if let Ok(spotify) = &self.spotify
+                    && let Err(error) = spotify.logout()
+                {
+                    self.error = Some(error.to_string());
+                }
+                self.session = Session::SignedOut;
+                self.player = None;
+                self.last_item = None;
+                self.artwork = None;
+                self.saved = None;
+                self.saved_uri.clear();
+                self.loaded = false;
+                self.library = Library::default();
+                self.forget_playback();
+            }
+            Message::OpenDashboard => self.open_url(DASHBOARD_URL),
+            Message::CopyRedirectUri => {
+                self.copied = true;
+                return Task::batch([
+                    cosmic::iced::clipboard::write(self.config.redirect_uri()),
+                    delayed(Duration::from_secs(2), Message::CopiedReset),
+                ]);
+            }
+            Message::CopiedReset => self.copied = false,
+            Message::SetShowTrack(show) => {
+                self.write_config(|config, handler| config.set_show_track(handler, show));
+            }
+            Message::Poll => return self.refresh_player(),
+            Message::Tick => {
+                // A track that ran out locally has changed on Spotify's side too.
+                if let Some(item) = self.item()
+                    && self.is_playing()
+                    && item.duration_ms > 0
+                    && self.progress_ms() >= item.duration_ms
+                {
+                    return self.refresh_player();
+                }
+            }
+            Message::PlayerLoaded(result) => match *result {
+                Ok(player) => return self.apply_player(player),
+                Err(error) => self.handle_api_error(&error),
+            },
+            Message::SavedLoaded(uri, result) => {
+                if uri == self.saved_uri {
+                    self.saved = result.ok();
+                }
+            }
+            Message::ArtLoaded(url, result) => {
+                if self.art_pending.as_deref() == Some(url.as_str()) {
+                    self.art_pending = None;
+                }
+                match result {
+                    Ok(artwork) if self.wanted_art() == Some(url.as_str()) => {
+                        self.artwork = Some(artwork);
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("unable to load cover {url}: {error}"),
+                }
+            }
+            Message::PlayPause => {
+                let playing = self.is_playing();
+                self.reanchor_progress();
+                if let Some(player) = self.player.as_mut() {
+                    player.is_playing = !playing;
+                }
+                return if playing {
+                    self.command(|spotify| async move { spotify.pause().await })
+                } else {
+                    self.command(|spotify| async move { spotify.play().await })
+                };
+            }
+            Message::Next => return self.command(|spotify| async move { spotify.next().await }),
+            Message::Previous => {
+                return self.command(|spotify| async move { spotify.previous().await });
+            }
+            Message::ToggleShuffle => {
+                let Some(player) = self.player.as_mut() else {
+                    return Task::none();
+                };
+                player.shuffle = !player.shuffle;
+                let on = player.shuffle;
+                return self.command(move |spotify| async move { spotify.set_shuffle(on).await });
+            }
+            Message::CycleRepeat => {
+                let Some(player) = self.player.as_mut() else {
+                    return Task::none();
+                };
+                player.repeat = player.repeat.next();
+                let mode = player.repeat;
+                return self.command(move |spotify| async move { spotify.set_repeat(mode).await });
+            }
+            Message::ToggleSaved => {
+                let Some(uri) = self.item().map(|item| item.uri.clone()) else {
+                    return Task::none();
+                };
+                let save = !self.saved.unwrap_or(false);
+                self.saved = Some(save);
+                return self.command(move |spotify| async move {
+                    if save {
+                        spotify.save(&uri).await
+                    } else {
+                        spotify.unsave(&uri).await
+                    }
+                });
+            }
+            Message::SeekDrag(position) => {
+                if self.item().is_some() {
+                    self.seek_drag = Some(position);
+                }
+            }
+            Message::SeekRelease => {
+                let Some(position) = self.seek_drag.take() else {
+                    return Task::none();
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let position = position.max(0.0) as u64;
+                if let Some(player) = self.player.as_mut() {
+                    player.progress_ms = position;
+                }
+                self.fetched_at = Instant::now();
+                return self.command(move |spotify| async move { spotify.seek(position).await });
+            }
+            Message::SetVolume(volume) => return self.set_volume(volume),
+            Message::VolumeCommit(generation) => {
+                if generation != self.volume_generation {
+                    return Task::none();
+                }
+                let Some(volume) = self.volume() else {
+                    return Task::none();
+                };
+                return self
+                    .command(move |spotify| async move { spotify.set_volume(volume).await });
+            }
+            Message::ToggleMute => {
+                let Some(volume) = self.volume() else {
+                    return Task::none();
+                };
+                if volume > 0 {
+                    self.volume_before_mute = Some(volume);
+                    return self.set_volume(0);
+                }
+                let restored = self.volume_before_mute.take().unwrap_or(50);
+                return self.set_volume(restored);
+            }
+            Message::Scroll(delta) => return self.scroll_volume(delta),
+            Message::CommandDone(result) => {
+                if let Err(error) = result {
+                    self.handle_api_error(&error);
+                }
+                return self.refresh_player();
+            }
+            Message::Browse(message) => return self.update_browse(message),
+            Message::EnablePlayback => return self.enable_playback(),
+            Message::CancelPlayback => {
+                self.playback_login = None;
+                if self.playback == Playback::Authorizing {
+                    self.playback = Playback::NeedsLogin;
+                }
+                self.sync_playback();
+            }
+            Message::PlaybackLoginFinished(result) => {
+                self.playback_login = None;
+                self.playback = Playback::NeedsLogin;
+                self.sync_playback();
+                match result {
+                    Ok(()) => {
+                        self.error = None;
+                        return self.notify("Listo, esta compu ya puede reproducir".into());
+                    }
+                    Err(error) if self.playback != Playback::Ready => self.error = Some(error),
+                    Err(_) => {}
+                }
+            }
+            Message::DisablePlayback => self.forget_playback(),
         }
         Task::none()
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subscriptions = vec![
+            self.core.watch_config::<AppConfig>(APP_ID).map(|update| {
+                for error in update.errors {
+                    eprintln!("config watch error: {error}");
+                }
+                Message::ConfigChanged(update.config)
+            }),
+            activation_token_subscription(0).map(Message::Token),
+        ];
+        if matches!(self.session, Session::Connected(_)) {
+            subscriptions.push(time::every(self.poll_interval()).map(|_| Message::Poll));
+            if self.popup.is_some() && self.is_playing() {
+                subscriptions.push(time::every(Duration::from_secs(1)).map(|_| Message::Tick));
+            }
+        }
+        Subscription::batch(subscriptions)
+    }
+
     fn view(&self) -> Element<'_, Message> {
-        self.core
-            .applet
-            .icon_button("face-smile-symbolic")
-            .on_press(Message::TogglePopup)
-            .into()
+        ui::panel(self)
     }
 
     fn view_window(&self, _id: Id) -> Element<'_, Message> {
-        popup_content(&self.core, self.clicks)
+        ui::popup(self)
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
@@ -80,17 +484,399 @@ impl cosmic::Application for Window {
 }
 
 impl Window {
-    fn toggle_popup(&mut self) -> Task<Action<Message>> {
-        if let Some(popup) = self.popup.take() {
-            return surface_task(destroy_popup(popup));
+    pub(crate) fn client(&self) -> Option<Spotify> {
+        self.spotify.as_ref().ok().cloned()
+    }
+
+    pub(crate) fn item(&self) -> Option<&Item> {
+        self.player.as_ref().and_then(|player| player.item.as_ref())
+    }
+
+    pub(crate) fn is_playing(&self) -> bool {
+        self.player
+            .as_ref()
+            .is_some_and(|player| player.is_playing && player.item.is_some())
+    }
+
+    pub(crate) fn is_connecting(&self) -> bool {
+        self.login.is_some()
+    }
+
+    pub(crate) fn volume(&self) -> Option<u8> {
+        self.player
+            .as_ref()
+            .and_then(|player| player.device.as_ref())
+            .filter(|device| device.supports_volume)
+            .and_then(|device| device.volume)
+    }
+
+    /// Advances between polls from the last reported position.
+    pub(crate) fn progress_ms(&self) -> u64 {
+        if let Some(position) = self.seek_drag {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            return position.max(0.0) as u64;
+        }
+        let Some(player) = self.player.as_ref() else {
+            return 0;
+        };
+        let duration = player.item.as_ref().map_or(0, |item| item.duration_ms);
+        let mut progress = player.progress_ms;
+        if player.is_playing {
+            let elapsed = u64::try_from(self.fetched_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            progress = progress.saturating_add(elapsed);
+        }
+        if duration > 0 {
+            progress.min(duration)
+        } else {
+            progress
+        }
+    }
+
+    fn reanchor_progress(&mut self) {
+        let progress = self.progress_ms();
+        if let Some(player) = self.player.as_mut() {
+            player.progress_ms = progress;
+        }
+        self.fetched_at = Instant::now();
+    }
+
+    fn poll_interval(&self) -> Duration {
+        Duration::from_secs(if self.popup.is_some() {
+            4
+        } else if self.is_playing() {
+            15
+        } else {
+            60
+        })
+    }
+
+    fn wanted_art(&self) -> Option<&str> {
+        self.item()
+            .or(self.last_item.as_ref())
+            .and_then(|item| item.art_url.as_deref())
+    }
+
+    fn write_config(
+        &mut self,
+        set: impl FnOnce(&mut AppConfig, &Config) -> Result<bool, cosmic_config::Error>,
+    ) {
+        let Some(handler) = self.config_handler.as_ref() else {
+            eprintln!("unable to save config: no config handler");
+            return;
+        };
+        if let Err(error) = set(&mut self.config, handler) {
+            eprintln!("unable to save config: {error}");
+        }
+    }
+
+    /// Asks the compositor for an activation token first, so the browser comes
+    /// to the front; the URL travels with the request and comes back with the token.
+    fn open_url(&mut self, url: &str) {
+        if let Some(tx) = &self.token_tx
+            && tx
+                .send(TokenRequest {
+                    app_id: APP_ID.to_owned(),
+                    exec: url.to_owned(),
+                })
+                .is_ok()
+        {
+            return;
+        }
+        self.launch(url, None);
+    }
+
+    fn launch(&mut self, url: &str, token: Option<&str>) {
+        if let Err(error) = browser::open(url, token) {
+            self.error = Some(spotify::Error::Browser(error).to_string());
+        }
+    }
+
+    fn connect(&mut self) -> Task<Action<Message>> {
+        if self.login.is_some() {
+            return Task::none();
+        }
+        let spotify = match &self.spotify {
+            Ok(spotify) => spotify.clone(),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return Task::none();
+            }
+        };
+
+        let client_id = self.client_id_draft.trim().to_owned();
+        self.client_id_draft.clone_from(&client_id);
+        if client_id != self.config.client_id {
+            let value = client_id.clone();
+            self.write_config(|config, handler| config.set_client_id(handler, value));
         }
 
+        let pending = match Spotify::begin_login(&client_id, self.config.redirect_port) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.error = Some(error.to_string());
+                return Task::none();
+            }
+        };
+        self.error = None;
+        self.open_url(pending.url().as_str());
+
+        let (task, handle) = Task::perform(
+            async move { spotify.complete_login(pending).await },
+            |result| Action::App(Message::LoginFinished(result)),
+        )
+        .abortable();
+        // Aborting drops the future, which also closes the callback listener.
+        self.login = Some(handle.abort_on_drop());
+        task
+    }
+
+    /// Re-reads whether the receiver is installed and authorized, and points
+    /// playback at it when it is.
+    fn sync_playback(&mut self) {
+        if self.playback == Playback::Authorizing {
+            return;
+        }
+        self.playback = if player::binary().is_none() {
+            Playback::Missing
+        } else if player::authorized() {
+            Playback::Ready
+        } else {
+            Playback::NeedsLogin
+        };
+        let local = (self.playback == Playback::Ready).then(|| self.device_name.clone());
+        if let Ok(spotify) = &self.spotify {
+            spotify.set_local_device(local);
+        }
+        self.ensure_receiver();
+    }
+
+    /// Restarts the receiver if it is not running, e.g. after a reboot or
+    /// when its session kept dropping.
+    fn ensure_receiver(&mut self) {
+        if self.playback != Playback::Ready
+            || !matches!(self.session, Session::Connected(_))
+            || player::running()
+        {
+            return;
+        }
+        if let Err(error) = player::start() {
+            self.error = Some(error);
+        }
+    }
+
+    fn enable_playback(&mut self) -> Task<Action<Message>> {
+        match self.playback {
+            Playback::Missing => {
+                self.error = Some(format!(
+                    "Falta {} junto al applet; reinstalalo con «just install».",
+                    player::BINARY
+                ));
+                Task::none()
+            }
+            Playback::Authorizing | Playback::Ready => Task::none(),
+            Playback::NeedsLogin => {
+                self.playback = Playback::Authorizing;
+                self.error = None;
+                if let Some(tx) = &self.token_tx
+                    && tx
+                        .send(TokenRequest {
+                            app_id: APP_ID.to_owned(),
+                            exec: PLAYER_LOGIN.to_owned(),
+                        })
+                        .is_ok()
+                {
+                    return Task::none();
+                }
+                self.authorize_playback(None)
+            }
+        }
+    }
+
+    /// Runs once the activation token is back (or could not be had).
+    fn authorize_playback(&mut self, token: Option<String>) -> Task<Action<Message>> {
+        // Cancelled while the token was on its way.
+        if self.playback != Playback::Authorizing || self.playback_login.is_some() {
+            return Task::none();
+        }
+        let (task, handle) = Task::perform(player::login(token), |result| {
+            Action::App(Message::PlaybackLoginFinished(result))
+        })
+        .abortable();
+        // Aborting drops the future, which kills the login process.
+        self.playback_login = Some(handle.abort_on_drop());
+        task
+    }
+
+    fn forget_playback(&mut self) {
+        self.playback_login = None;
+        player::forget();
+        if let Ok(spotify) = &self.spotify {
+            spotify.set_local_device(None);
+        }
+        self.playback = if player::binary().is_some() {
+            Playback::NeedsLogin
+        } else {
+            Playback::Missing
+        };
+    }
+
+    pub(crate) fn refresh_player(&self) -> Task<Action<Message>> {
+        let Ok(spotify) = &self.spotify else {
+            return Task::none();
+        };
+        if !matches!(self.session, Session::Connected(_)) {
+            return Task::none();
+        }
+        let spotify = spotify.clone();
+        Task::perform(async move { spotify.player().await }, |result| {
+            Action::App(Message::PlayerLoaded(Box::new(result)))
+        })
+    }
+
+    fn apply_player(&mut self, player: Option<PlayerState>) -> Task<Action<Message>> {
+        if let Some(item) = self.item() {
+            self.last_item = Some(item.clone());
+        }
+        self.player = player;
+        self.fetched_at = Instant::now();
+        self.loaded = true;
+        self.error = None;
+        if let Some(item) = self.item() {
+            self.last_item = Some(item.clone());
+        }
+
+        let mut tasks = Vec::new();
+        if let Some(uri) = self.item().map(|item| item.uri.clone())
+            && uri != self.saved_uri
+        {
+            self.saved_uri.clone_from(&uri);
+            self.saved = None;
+            tasks.push(self.check_saved(uri));
+        }
+        if let Some(url) = self.wanted_art().map(str::to_owned)
+            && self.artwork.as_ref().is_none_or(|art| art.url != url)
+            && self.art_pending.as_deref() != Some(url.as_str())
+        {
+            self.art_pending = Some(url.clone());
+            tasks.push(self.load_art(url));
+        }
+        Task::batch(tasks)
+    }
+
+    fn check_saved(&self, uri: String) -> Task<Action<Message>> {
+        let Ok(spotify) = &self.spotify else {
+            return Task::none();
+        };
+        let spotify = spotify.clone();
+        Task::perform(
+            async move {
+                let result = spotify.is_saved(&uri).await;
+                (uri, result)
+            },
+            |(uri, result)| Action::App(Message::SavedLoaded(uri, result)),
+        )
+    }
+
+    fn load_art(&self, url: String) -> Task<Action<Message>> {
+        let Ok(spotify) = &self.spotify else {
+            return Task::none();
+        };
+        let spotify = spotify.clone();
+        Task::perform(
+            async move {
+                let result = match spotify.artwork(&url).await {
+                    Ok(bytes) => art::decode(url.clone(), &bytes),
+                    Err(error) => Err(error.to_string()),
+                };
+                (url, result)
+            },
+            |(url, result)| Action::App(Message::ArtLoaded(url, result)),
+        )
+    }
+
+    /// Runs a player command, then lets Spotify settle before the state is re-read.
+    pub(crate) fn command<F, Fut>(&self, run: F) -> Task<Action<Message>>
+    where
+        F: FnOnce(Spotify) -> Fut,
+        Fut: Future<Output = Result<(), spotify::Error>> + Send + 'static,
+    {
+        let Ok(spotify) = &self.spotify else {
+            return Task::none();
+        };
+        let pending = run(spotify.clone());
+        Task::perform(
+            async move {
+                let result = pending.await;
+                if result.is_ok() {
+                    tokio::time::sleep(SETTLE).await;
+                }
+                result
+            },
+            |result| Action::App(Message::CommandDone(result)),
+        )
+    }
+
+    /// Moves the slider at once and sends only the value it settles on.
+    fn set_volume(&mut self, volume: u8) -> Task<Action<Message>> {
+        let Some(device) = self
+            .player
+            .as_mut()
+            .and_then(|player| player.device.as_mut())
+            .filter(|device| device.supports_volume)
+        else {
+            return Task::none();
+        };
+        device.volume = Some(volume.min(100));
+        self.volume_generation += 1;
+        delayed(
+            VOLUME_DEBOUNCE,
+            Message::VolumeCommit(self.volume_generation),
+        )
+    }
+
+    fn scroll_volume(&mut self, delta: ScrollDelta) -> Task<Action<Message>> {
+        let Some(volume) = self.volume() else {
+            return Task::none();
+        };
+        self.scroll_notches += match delta {
+            ScrollDelta::Lines { y, .. } => y,
+            ScrollDelta::Pixels { y, .. } => y / PIXELS_PER_NOTCH,
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let notches = self.scroll_notches.trunc() as i16;
+        if notches == 0 {
+            return Task::none();
+        }
+        self.scroll_notches -= f32::from(notches);
+        let target = (i16::from(volume) + notches * VOLUME_STEP).clamp(0, 100);
+        self.set_volume(u8::try_from(target).unwrap_or(0))
+    }
+
+    pub(crate) fn handle_api_error(&mut self, error: &spotify::Error) {
+        match error {
+            spotify::Error::Reauth => self.session = Session::NeedsReauth,
+            spotify::Error::SignedOut => self.session = Session::SignedOut,
+            _ => {}
+        }
+        self.error = Some(error.to_string());
+    }
+
+    fn close_popup(&mut self) -> Task<Action<Message>> {
+        let Some(popup) = self.popup.take() else {
+            return Task::none();
+        };
+        self.view = View::Player;
+        self.library.devices = None;
+        surface_task(destroy_popup(popup))
+    }
+
+    fn open_popup(&mut self) -> Task<Action<Message>> {
         let Some(parent) = self.core.main_window_id() else {
             return Task::none();
         };
 
         surface_task(app_popup::<Window>(
-            |_| Default::default(),
+            |_| LiveSettings::default(),
             move |state: &mut Window| {
                 let popup = Id::unique();
                 let mut settings = state
@@ -98,35 +884,39 @@ impl Window {
                     .applet
                     .get_popup_settings(parent, popup, None, None, None);
                 settings.positioner.size_limits = Limits::NONE
-                    .min_width(200.0)
-                    .max_width(360.0)
-                    .min_height(100.0)
-                    .max_height(600.0);
+                    .min_width(360.0)
+                    .max_width(ui::POPUP_WIDTH)
+                    .min_height(120.0)
+                    .max_height(1000.0);
+                // The default anchor centers the popup on an icon-sized applet,
+                // which misaligns it under the wider cover-and-title button.
+                match state.core.applet.anchor {
+                    PanelAnchor::Top => {
+                        settings.positioner.anchor = Anchor::BottomLeft;
+                        settings.positioner.gravity = Gravity::BottomRight;
+                    }
+                    PanelAnchor::Bottom => {
+                        settings.positioner.anchor = Anchor::TopLeft;
+                        settings.positioner.gravity = Gravity::TopRight;
+                    }
+                    PanelAnchor::Left | PanelAnchor::Right => {}
+                }
                 state.popup = Some(popup);
                 settings
             },
             Some(Box::new(|state: &Window| {
-                popup_content(&state.core, state.clicks).map(cosmic::Action::App)
+                ui::popup(state).map(cosmic::Action::App)
             })),
         ))
     }
 }
 
-fn popup_content(core: &Core, clicks: u32) -> Element<'_, Message> {
-    let content = Column::new()
-        .spacing(12)
-        .padding(16)
-        .width(Length::Fill)
-        .align_x(Alignment::Center)
-        .push(text::title4("Hola desde COSMIC"))
-        .push(text(format!("Clicks: {clicks}")))
-        .push(button::suggested("Sumar").on_press(Message::Increment));
-
-    core.applet.popup_container(content).into()
+pub(crate) fn delayed(after: Duration, message: Message) -> Task<Action<Message>> {
+    Task::perform(tokio::time::sleep(after), move |()| {
+        Action::App(message.clone())
+    })
 }
 
 fn surface_task(action: cosmic::surface::Action) -> Task<Action<Message>> {
-    cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(
-        action,
-    )))
+    cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)))
 }

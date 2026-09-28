@@ -1,0 +1,20 @@
+[package]
+name = "cosmic-ext-spotify-player"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0"
+description = "Local Spotify Connect receiver for cosmic-ext-applet-spotify"
+
+# Pinned to the librespot fork used by omarchy-spotify-client: it smooths manual
+# track switches (librespot PR #1740) and stops cleanly when Spotify refuses an
+# audio key instead of skipping through the whole queue.
+[dependencies]
+env_logger = { version = "0.11", default-features = false }
+libc = "0.2.189"
+librespot-connect = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-core = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-oauth = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["rustls-tls-native-roots"] }
+librespot-playback = { git = "https://github.com/stappmus/librespot", rev = "6d3ecd76115c08a5e606d6f6d2181932314afed2", default-features = false, features = ["pulseaudio-backend", "rustls-tls-native-roots"] }
+log = "0.4"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["macros", "rt", "signal", "sync", "time"] }
