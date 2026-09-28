@@ -9,7 +9,7 @@ mod library;
 mod store;
 mod types;
 
-pub use api::{Session, Spotify};
+pub use api::{ListPage, Session, Spotify};
 pub use error::Error;
 pub use library::{Entry, EntryKind, SearchGroup};
 pub use store::{Store, StoredAuth};

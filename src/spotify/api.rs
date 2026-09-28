@@ -18,6 +18,7 @@ const SEARCH_LIMIT: u8 = 6;
 const RECENT_LIMIT: usize = 30;
 const LIBRARY_LIMIT: usize = 100;
 const LIST_LIMIT: usize = 200;
+const PAGE_SIZE: usize = 50;
 const MAX_PLAY_URIS: usize = 100;
 const LOCAL_DEVICE_POLLS: u32 = 8;
 const LOCAL_DEVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -29,6 +30,13 @@ pub enum Session {
     SignedOut,
     NeedsReauth,
     Connected(User),
+}
+
+/// One page of a collection. `next` is the offset of the following page.
+#[derive(Clone, Debug)]
+pub struct ListPage {
+    pub entries: Vec<Entry>,
+    pub next: Option<usize>,
 }
 
 /// Cheap to clone: every clone shares the session and the HTTP connection pool.
@@ -464,11 +472,6 @@ impl Spotify {
         Ok((playlists, liked))
     }
 
-    pub async fn liked(&self) -> Result<Vec<Entry>, Error> {
-        self.collection("/me/tracks", &[], Some("track"), LIST_LIMIT)
-            .await
-    }
-
     pub async fn shows(&self) -> Result<Vec<Entry>, Error> {
         self.collection("/me/shows", &[], Some("show"), LIBRARY_LIMIT)
             .await
@@ -479,20 +482,73 @@ impl Spotify {
             .await
     }
 
-    /// What is inside an album, playlist, show or audiobook.
-    pub async fn contents(&self, parent: &Entry) -> Result<Vec<Entry>, Error> {
+    /// One page of a paged collection, plus the offset of the following page.
+    pub async fn list_page(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+        envelope: Option<&str>,
+        offset: usize,
+    ) -> Result<ListPage, Error> {
+        let limit = PAGE_SIZE.to_string();
+        let offset_text = offset.to_string();
+        let mut window = query.to_vec();
+        window.push(("limit", limit.as_str()));
+        window.push(("offset", offset_text.as_str()));
+        let Some(body) = self.get::<Value>(path, &window).await? else {
+            return Ok(ListPage {
+                entries: Vec::new(),
+                next: None,
+            });
+        };
+        let got = body
+            .get("items")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let entries = library::entries(&body, envelope, None);
+        let more = got > 0 && body.get("next").is_some_and(|next| !next.is_null());
+        let next = more
+            .then_some(offset + got)
+            .filter(|next| *next < LIST_LIMIT);
+        Ok(ListPage { entries, next })
+    }
+
+    /// Liked songs, one page at a time. `next` is the offset to ask for afterwards.
+    pub async fn liked_from(&self, offset: usize) -> Result<ListPage, Error> {
+        self.list_page("/me/tracks", &[], Some("track"), offset)
+            .await
+    }
+
+    /// One page of whatever is inside an album, playlist, show or audiobook.
+    pub async fn contents_from(&self, parent: &Entry, offset: usize) -> Result<ListPage, Error> {
+        let id = check_id(&parent.id)?;
+        match parent.kind {
+            EntryKind::Playlist => {
+                self.list_page(
+                    &format!("/playlists/{id}/items"),
+                    &[("additional_types", "track,episode")],
+                    Some("item"),
+                    offset,
+                )
+                .await
+            }
+            _ if offset == 0 => {
+                let entries = self.embedded_contents(parent).await?;
+                Ok(ListPage {
+                    entries,
+                    next: None,
+                })
+            }
+            _ => Ok(ListPage {
+                entries: Vec::new(),
+                next: None,
+            }),
+        }
+    }
+
+    async fn embedded_contents(&self, parent: &Entry) -> Result<Vec<Entry>, Error> {
         let id = check_id(&parent.id)?;
         let (path, inner) = match parent.kind {
-            EntryKind::Playlist => {
-                return self
-                    .collection(
-                        &format!("/playlists/{id}/items"),
-                        &[("additional_types", "track,episode")],
-                        Some("item"),
-                        LIST_LIMIT,
-                    )
-                    .await;
-            }
             // These objects carry their first page of contents inline.
             EntryKind::Album => (format!("/albums/{id}"), "tracks"),
             EntryKind::Show => (format!("/shows/{id}"), "episodes"),

@@ -121,7 +121,7 @@ impl Clock {
         let last = px(feed::WAVE - 1);
         for (index, sample) in self.wave.iter_mut().enumerate() {
             *sample = match &frame {
-                Some(frame) => (frame.wave[index] - *sample).mul_add(0.6, *sample),
+                Some(frame) => frame.wave[index],
                 None => wave_sample(px(index) / last, self.phase),
             };
         }

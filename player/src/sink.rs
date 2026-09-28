@@ -77,6 +77,9 @@ pub struct PulseTap {
     stream: Option<Simple>,
     tap: Arc<Tap>,
     bytes: Vec<u8>,
+    /// Last latency we asked `PulseAudio` for. Asking on every packet stalls playback.
+    latency: Duration,
+    latency_at: Option<Instant>,
 }
 
 impl PulseTap {
@@ -85,7 +88,28 @@ impl PulseTap {
             stream: None,
             tap,
             bytes: Vec::new(),
+            latency: TARGET_LATENCY,
+            latency_at: None,
         }
+    }
+
+    /// `PipeWire` often reports a buffer much larger than the one we asked for.
+    /// Chasing that number puts the scope a beat behind the speakers.
+    fn refresh_latency(&mut self) -> Duration {
+        let now = Instant::now();
+        let fresh = self
+            .latency_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_millis(250));
+        if fresh {
+            self.latency_at = Some(now);
+            if let Some(stream) = self.stream.as_ref()
+                && let Ok(reported) = stream.get_latency()
+            {
+                let reported = Duration::from_micros(reported.0);
+                self.latency = reported.clamp(Duration::from_millis(40), TARGET_LATENCY);
+            }
+        }
+        self.latency
     }
 }
 
@@ -150,10 +174,6 @@ impl Sink for PulseTap {
                 "raw audio is not supported".into(),
             ));
         };
-        let stream = self
-            .stream
-            .as_ref()
-            .ok_or_else(|| SinkError::NotConnected("the audio stream is closed".into()))?;
         self.bytes.clear();
         self.bytes.extend(
             converter
@@ -161,12 +181,14 @@ impl Sink for PulseTap {
                 .iter()
                 .flat_map(|sample| sample.to_ne_bytes()),
         );
+        let latency = self.refresh_latency();
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| SinkError::NotConnected("the audio stream is closed".into()))?;
         stream
             .write(&self.bytes)
             .map_err(|error| SinkError::OnWrite(describe(error)))?;
-        let latency = stream
-            .get_latency()
-            .map_or(TARGET_LATENCY, |latency| Duration::from_micros(latency.0));
         self.tap.push(&samples, latency);
         Ok(())
     }

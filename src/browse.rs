@@ -1,7 +1,7 @@
 //! The library half of the popup: search, playlists, podcasts, audiobooks,
 //! the contents of whatever is opened, and the device picker.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use cosmic::widget::image::Handle;
@@ -16,6 +16,11 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
 const NOTICE_FOR: Duration = Duration::from_secs(3);
 /// Thumbnails are small, but a long browsing session should not keep them all.
 const MAX_THUMBS: usize = 600;
+/// How many covers download at once. More than this stalls the popup.
+const THUMB_PARALLEL: usize = 6;
+/// About one library row, used to guess which covers are on screen.
+const ROW_PX: f32 = 56.0;
+const VISIBLE_ROWS: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
@@ -84,6 +89,8 @@ pub struct Library {
     /// False while a saved offset is being put back, so the jump to the top
     /// is not stored over the real position.
     scroll_live: bool,
+    thumb_waiting: VecDeque<String>,
+    thumbs_inflight: usize,
 }
 
 impl Default for Library {
@@ -112,6 +119,8 @@ impl Default for Library {
             notice_generation: 0,
             scroll: HashMap::new(),
             scroll_live: false,
+            thumb_waiting: VecDeque::new(),
+            thumbs_inflight: 0,
         }
     }
 }
@@ -159,7 +168,7 @@ pub enum Browse {
     /// Play a whole context without opening it.
     PlayContext(Entry),
     OpenLiked,
-    DetailLoaded(String, Result<Vec<Entry>, spotify::Error>),
+    DetailPage(String, Result<spotify::ListPage, spotify::Error>),
     CloseDetail,
     PlayDetail,
     Queue(Entry),
@@ -169,6 +178,23 @@ pub enum Browse {
     DevicesLoaded(Result<Vec<Device>, spotify::Error>),
     Transfer(String),
     ClearNotice(u64),
+}
+
+fn detail_request(
+    spotify: spotify::Spotify,
+    source: Source,
+    offset: usize,
+) -> Task<Action<Message>> {
+    let key = source.key().to_owned();
+    Task::perform(
+        async move {
+            match &source {
+                Source::Liked => spotify.liked_from(offset).await,
+                Source::Entry(entry) => spotify.contents_from(entry, offset).await,
+            }
+        },
+        move |result| browse(Browse::DetailPage(key, result)),
+    )
 }
 
 fn browse(message: Browse) -> Action<Message> {
@@ -233,12 +259,12 @@ impl Window {
                 }
                 self.note_error(&result);
                 self.library.results = Load::from_result(result);
-                return self.fetch_visible_thumbs();
+                return self.enqueue_thumbs();
             }
             Browse::RecentLoaded(result) => {
                 self.note_error(&result);
                 self.library.recent = Load::from_result(result);
-                return self.fetch_visible_thumbs();
+                return self.enqueue_thumbs();
             }
             Browse::PlaylistsLoaded(result) => {
                 self.note_error(&result);
@@ -249,17 +275,17 @@ impl Window {
                     }
                     Err(error) => Load::Failed(error.to_string()),
                 };
-                return self.fetch_visible_thumbs();
+                return self.enqueue_thumbs();
             }
             Browse::ShowsLoaded(result) => {
                 self.note_error(&result);
                 self.library.shows = Load::from_result(result);
-                return self.fetch_visible_thumbs();
+                return self.enqueue_thumbs();
             }
             Browse::BooksLoaded(result) => {
                 self.note_error(&result);
                 self.library.books = Load::from_result(result);
-                return self.fetch_visible_thumbs();
+                return self.enqueue_thumbs();
             }
             Browse::Activate(entry) => return self.activate(entry),
             Browse::PlayContext(entry) => {
@@ -268,33 +294,7 @@ impl Window {
                     .command(move |spotify| async move { spotify.play_context(&uri, None).await });
             }
             Browse::OpenLiked => return self.open(Source::Liked),
-            Browse::DetailLoaded(key, result) => {
-                self.note_error(&result);
-                if let Some(detail) = self.library.detail.as_mut()
-                    && detail.source.key() == key
-                {
-                    // Since February 2026 Spotify only lists tracks of playlists
-                    // the user owns or collaborates on. A public one still plays.
-                    let blocked = matches!(
-                        (&result, &detail.source),
-                        (
-                            Err(spotify::Error::Forbidden(_)),
-                            Source::Entry(entry)
-                        ) if entry.kind == EntryKind::Playlist
-                    );
-                    detail.items = if blocked {
-                        Load::Failed(
-                            "Spotify no deja ver las canciones de una playlist que no es tuya ni en la que colaborás. Pero aún así, podés reproducirla.".into(),
-                        )
-                    } else {
-                        Load::from_result(result)
-                    };
-                    return Task::batch([
-                        self.fetch_visible_thumbs(),
-                        self.restore_library_scroll(),
-                    ]);
-                }
-            }
+            Browse::DetailPage(key, result) => return self.detail_page(&key, result),
             Browse::CloseDetail => {
                 self.library.detail = None;
                 return self.restore_library_scroll();
@@ -306,11 +306,10 @@ impl Window {
                 return Task::batch([task, self.notify(format!("En cola: {}", entry.name))]);
             }
             Browse::ThumbLoaded(url, handle) => {
-                if handle.is_none() {
-                    // Leave the placeholder; the entry stays so it is not retried in a loop.
-                    return Task::none();
-                }
+                self.library.thumbs_inflight = self.library.thumbs_inflight.saturating_sub(1);
+                // `None` stays in the map so a failed cover is not requested again.
                 self.library.thumbs.insert(url, handle);
+                return self.pump_thumbs();
             }
             Browse::Reload => {
                 match self.library.tab {
@@ -324,6 +323,9 @@ impl Window {
                     Tab::Playlists => self.library.playlists = Load::Idle,
                     Tab::Podcasts => self.library.shows = Load::Idle,
                     Tab::Books => self.library.books = Load::Idle,
+                }
+                if let Some(detail) = self.library.detail.as_mut() {
+                    detail.items = Load::Idle;
                 }
                 let detail = self
                     .library
@@ -485,21 +487,82 @@ impl Window {
             return Task::none();
         };
         let key = source.key().to_owned();
+        if let Some(detail) = &self.library.detail
+            && detail.source.key() == key
+            && matches!(detail.items, Load::Ready(_))
+        {
+            return self.enqueue_thumbs();
+        }
         // The list is about to be replaced. Ignore the placeholder's scroll.
         self.library.scroll_live = false;
         self.library.detail = Some(Detail {
             source: source.clone(),
             items: Load::Loading,
         });
-        Task::perform(
-            async move {
-                match &source {
-                    Source::Liked => spotify.liked().await,
-                    Source::Entry(entry) => spotify.contents(entry).await,
+        detail_request(spotify, source, 0)
+    }
+
+    fn detail_page(
+        &mut self,
+        key: &str,
+        result: Result<spotify::ListPage, spotify::Error>,
+    ) -> Task<Action<Message>> {
+        self.note_error(&result);
+        let Some((first, follow)) = self.store_detail_page(key, result) else {
+            return Task::none();
+        };
+        let Some(spotify) = self.client() else {
+            return self.enqueue_thumbs();
+        };
+        let mut tasks = vec![self.enqueue_thumbs()];
+        if first {
+            tasks.push(self.restore_library_scroll());
+        }
+        if let Some((source, offset)) = follow {
+            tasks.push(detail_request(spotify, source, offset));
+        }
+        Task::batch(tasks)
+    }
+
+    fn store_detail_page(
+        &mut self,
+        key: &str,
+        result: Result<spotify::ListPage, spotify::Error>,
+    ) -> Option<(bool, Option<(Source, usize)>)> {
+        let detail = self
+            .library
+            .detail
+            .as_mut()
+            .filter(|detail| detail.source.key() == key)?;
+        let first = !matches!(detail.items, Load::Ready(_));
+        let follow = match result {
+            Ok(page) => {
+                let next = page.next;
+                match &mut detail.items {
+                    Load::Ready(items) => items.extend(page.entries),
+                    _ => detail.items = Load::Ready(page.entries),
                 }
-            },
-            move |result| browse(Browse::DetailLoaded(key.clone(), result)),
-        )
+                next.map(|offset| (detail.source.clone(), offset))
+            }
+            Err(error) => {
+                if !matches!(detail.items, Load::Ready(_)) {
+                    // Since February 2026 Spotify only lists tracks of playlists
+                    // the user owns or collaborates on. A public one still plays.
+                    let blocked = matches!(
+                        (&error, &detail.source),
+                        (spotify::Error::Forbidden(_), Source::Entry(entry))
+                            if entry.kind == EntryKind::Playlist
+                    );
+                    detail.items = Load::Failed(if blocked {
+                        "Spotify no deja ver las canciones de una playlist que no es tuya ni en la que colaborás. Pero aún así, podés reproducirla.".into()
+                    } else {
+                        error.to_string()
+                    });
+                }
+                None
+            }
+        };
+        Some((first, follow))
     }
 
     fn play_detail(&mut self) -> Task<Action<Message>> {
@@ -546,16 +609,18 @@ impl Window {
 
     pub(crate) fn apply_library_scroll(&mut self, offset: f32) -> Task<Action<Message>> {
         self.library.scroll_live = true;
+        let thumbs = self.enqueue_thumbs();
         if offset < 1.0 {
-            return Task::none();
+            return thumbs;
         }
-        cosmic::iced::widget::scrollable::scroll_to(
+        let scroll = cosmic::iced::widget::scrollable::scroll_to(
             cosmic::widget::Id::new(crate::ui::LIBRARY_SCROLL),
             cosmic::iced::widget::scrollable::AbsoluteOffset {
                 x: Some(0.0),
                 y: Some(offset),
             },
-        )
+        );
+        Task::batch([scroll, thumbs])
     }
 
     pub(crate) fn notify(&mut self, text: String) -> Task<Action<Message>> {
@@ -599,39 +664,85 @@ impl Window {
         }
     }
 
-    fn fetch_visible_thumbs(&mut self) -> Task<Action<Message>> {
+    /// Queues covers for the rows on screen first, then the rest of the list.
+    pub(crate) fn enqueue_thumbs(&mut self) -> Task<Action<Message>> {
+        let urls = self.ordered_art_urls();
+        if self.library.thumbs.len() + urls.len() > MAX_THUMBS {
+            let keep = &urls;
+            self.library
+                .thumbs
+                .retain(|url, _| keep.iter().any(|wanted| wanted == url));
+        }
+        for url in urls.into_iter().rev() {
+            let queued = self
+                .library
+                .thumb_waiting
+                .iter()
+                .any(|waiting| waiting == &url);
+            if self.library.thumbs.contains_key(&url) || queued {
+                continue;
+            }
+            self.library.thumb_waiting.push_front(url);
+        }
+        self.pump_thumbs()
+    }
+
+    fn ordered_art_urls(&self) -> Vec<String> {
+        let entries = self.visible_entries();
+        let count = entries.len();
+        if count == 0 {
+            return Vec::new();
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let first = (self.library.saved_scroll() / ROW_PX) as usize;
+        let first = first.min(count - 1);
+        let last = (first + VISIBLE_ROWS).min(count);
+        let mut urls = Vec::new();
+        let mut push = |entry: &Entry| {
+            let Some(url) = &entry.art_url else {
+                return;
+            };
+            if !urls.contains(url) {
+                urls.push(url.clone());
+            }
+        };
+        for entry in &entries[first..last] {
+            push(entry);
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            if !(first..last).contains(&index) {
+                push(entry);
+            }
+        }
+        urls
+    }
+
+    fn pump_thumbs(&mut self) -> Task<Action<Message>> {
         let Some(spotify) = self.client() else {
             return Task::none();
         };
-        let wanted: Vec<String> = self
-            .visible_entries()
-            .iter()
-            .filter_map(|entry| entry.art_url.clone())
-            .collect();
-        let thumbs = &mut self.library.thumbs;
-        if thumbs.len() + wanted.len() > MAX_THUMBS {
-            thumbs.retain(|url, _| wanted.contains(url));
+        let mut tasks = Vec::new();
+        while self.library.thumbs_inflight < THUMB_PARALLEL {
+            let Some(url) = self.library.thumb_waiting.pop_front() else {
+                break;
+            };
+            if self.library.thumbs.contains_key(&url) {
+                continue;
+            }
+            self.library.thumbs.insert(url.clone(), None);
+            self.library.thumbs_inflight += 1;
+            let spotify = spotify.clone();
+            tasks.push(Task::perform(
+                async move {
+                    let handle = match art::fetch(url.clone(), spotify).await {
+                        Ok(bytes) => art::decode_thumb(&bytes).ok(),
+                        Err(_) => None,
+                    };
+                    (url, handle)
+                },
+                |(url, handle)| browse(Browse::ThumbLoaded(url, handle)),
+            ));
         }
-        let tasks: Vec<_> = wanted
-            .into_iter()
-            .filter(|url| !thumbs.contains_key(url))
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .map(|url| {
-                thumbs.insert(url.clone(), None);
-                let spotify = spotify.clone();
-                Task::perform(
-                    async move {
-                        let handle = match spotify.artwork(&url).await {
-                            Ok(bytes) => art::decode_thumb(&bytes).ok(),
-                            Err(_) => None,
-                        };
-                        (url, handle)
-                    },
-                    |(url, handle)| browse(Browse::ThumbLoaded(url, handle)),
-                )
-            })
-            .collect();
         Task::batch(tasks)
     }
 }

@@ -32,6 +32,8 @@ const VOLUME_STEP: i16 = 5;
 /// Spotify takes a moment before a command shows up in `/me/player`.
 const SETTLE: Duration = Duration::from_millis(700);
 const VOLUME_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How long the slider keeps the value the user chose while Spotify catches up.
+const VOLUME_HOLD: Duration = Duration::from_secs(3);
 /// Touchpads report pixels; this many make one wheel notch.
 const PIXELS_PER_NOTCH: f32 = 40.0;
 
@@ -79,6 +81,8 @@ pub struct Window {
     art_pending: Option<String>,
     pub(crate) seek_drag: Option<f64>,
     volume_generation: u64,
+    /// Value shown on the slider until a poll reports the same number.
+    volume_held: Option<(u8, Instant)>,
     volume_before_mute: Option<u8>,
     scroll_notches: f32,
     pub(crate) copied: bool,
@@ -180,6 +184,7 @@ impl cosmic::Application for Window {
             art_pending: None,
             seek_drag: None,
             volume_generation: 0,
+            volume_held: None,
             volume_before_mute: None,
             scroll_notches: 0.0,
             copied: false,
@@ -305,7 +310,10 @@ impl cosmic::Application for Window {
                 ]);
             }
             Message::CopiedReset => self.copied = false,
-            Message::LibraryScrolled(offset) => self.remember_library_scroll(offset),
+            Message::LibraryScrolled(offset) => {
+                self.remember_library_scroll(offset);
+                return self.enqueue_thumbs();
+            }
             Message::ApplyLibraryScroll(offset) => return self.apply_library_scroll(offset),
             Message::SetShowTrack(show) => {
                 self.write_config(|config, handler| config.set_show_track(handler, show));
@@ -760,7 +768,19 @@ impl Window {
         })
     }
 
-    fn apply_player(&mut self, player: Option<PlayerState>) -> Task<Action<Message>> {
+    fn apply_player(&mut self, mut player: Option<PlayerState>) -> Task<Action<Message>> {
+        // A poll that left before the volume command must not pull the slider back.
+        if let Some((held, at)) = self.volume_held {
+            let reported = player
+                .as_ref()
+                .and_then(|player| player.device.as_ref())
+                .and_then(|device| device.volume);
+            if reported == Some(held) || at.elapsed() > VOLUME_HOLD {
+                self.volume_held = None;
+            } else if let Some(device) = player.as_mut().and_then(|player| player.device.as_mut()) {
+                device.volume = Some(held);
+            }
+        }
         if let Some(item) = self.item() {
             self.last_item = Some(item.clone());
         }
@@ -811,7 +831,7 @@ impl Window {
         let spotify = spotify.clone();
         Task::perform(
             async move {
-                let result = match spotify.artwork(&url).await {
+                let result = match art::fetch(url.clone(), spotify).await {
                     Ok(bytes) => art::decode(url.clone(), &bytes),
                     Err(error) => Err(error.to_string()),
                 };
@@ -853,7 +873,9 @@ impl Window {
         else {
             return Task::none();
         };
-        device.volume = Some(volume.min(100));
+        let volume = volume.min(100);
+        device.volume = Some(volume);
+        self.volume_held = Some((volume, Instant::now()));
         self.volume_generation += 1;
         delayed(
             VOLUME_DEBOUNCE,
