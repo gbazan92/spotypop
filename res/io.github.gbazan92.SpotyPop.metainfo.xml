@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.gbazan92.SpotyPop</id>
+  <name>SpotyPop</name>
+  <summary>A Spotify mini player for the COSMIC panel</summary>
+  <developer id="io.github.gbazan92">
+    <name>Gerardo Bazán</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <description>
+    <p>
+      SpotyPop puts Spotify in the COSMIC panel: the current song with its cover
+      or a live audio scope, and a popup to control playback, search, browse your
+      playlists and podcasts, and manage the queue.
+    </p>
+    <p>
+      It can also turn this computer into a Spotify Connect device, so music plays
+      without the Spotify app open. Requires Spotify Premium and a free Spotify
+      developer app for its Client ID.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.gbazan92.SpotyPop.desktop</launchable>
+  <url type="homepage">https://github.com/gbazan92/spotypop</url>
+  <url type="bugtracker">https://github.com/gbazan92/spotypop/issues</url>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <provides>
+    <id>io.github.gbazan92.SpotyPop.desktop</id>
+  </provides>
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-28"/>
+  </releases>
+</component>

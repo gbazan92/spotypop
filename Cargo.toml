@@ -27,9 +27,10 @@ tokio = { version = "1.53.1", features = ["net", "time", "io-util", "sync", "mac
 url = "2.5.8"
 
 [dependencies.libcosmic]
-git = "https://github.com/pop-os/libcosmic.git"
-# libcosmic has no stable releases and its API changes often; bump deliberately.
-rev = "1f6dc991eaa5115a09be2505cc8a323e5b2b0bff"
+# Same URL, no rev, as cosmic-panel-config asks for it: otherwise Cargo keeps two
+# copies of libcosmic, which the offline Flatpak build cannot vendor side by side.
+# Cargo.lock pins the commit; bump it deliberately with `cargo update -p libcosmic`.
+git = "https://github.com/pop-os/libcosmic"
 default-features = false
 features = ["applet", "applet-token", "wayland", "tokio"]
 

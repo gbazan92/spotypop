@@ -16,6 +16,20 @@ A Spotify mini player for the [COSMIC](https://system76.com/cosmic) panel.
 - To build: Rust, [`just`](https://github.com/casey/just) and the PulseAudio
   headers (`sudo apt install libpulse-dev`; PipeWire serves the same API)
 
+## Install the Flatpak
+
+```sh
+flatpak install --user SpotyPop.flatpak
+```
+
+To build the bundle yourself (needs `org.flatpak.Builder` and the
+`org.freedesktop.Sdk//25.08` runtime with the `rust-stable` extension):
+
+```sh
+flatpak run org.flatpak.Builder --user --force-clean --repo=flatpak-repo flatpak-build io.github.gbazan92.SpotyPop.yml
+flatpak build-bundle flatpak-repo SpotyPop.flatpak io.github.gbazan92.SpotyPop
+```
+
 ## Install from source
 
 ```sh

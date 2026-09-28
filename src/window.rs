@@ -1276,8 +1276,8 @@ fn px(value: f32) -> u32 {
     value.round().max(0.0) as u32
 }
 
-fn surface_task(action: cosmic::surface::Action) -> Task<Action<Message>> {
-    cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)))
+fn surface_task(action: cosmic::surface::Action<Message>) -> Task<Action<Message>> {
+    cosmic::task::message(cosmic::Action::Surface(action))
 }
 
 #[cfg(test)]

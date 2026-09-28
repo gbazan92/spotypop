@@ -1,5 +1,6 @@
 use cosmic::Element;
 use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, LineHeight, Wrapping};
+use cosmic::iced::widget::scrollable::{Direction, Scrollbar};
 use cosmic::iced::{Alignment, Color, Length, Limits};
 use cosmic::theme;
 use cosmic::widget::button::Catalog;
@@ -717,11 +718,14 @@ fn library(state: &Window) -> Element<'_, Message> {
             scrollable(list_body(state))
                 .id(Id::new(LIBRARY_SCROLL))
                 .on_scroll(|viewport| Message::LibraryScrolled(viewport.absolute_offset().y))
-                .scrollbar_width(4.0)
-                .scroller_width(4.0)
-                .scrollbar_padding(2.0)
-                // Sit the bar beside the rows, instead of on top of the add buttons.
-                .spacing(10.0)
+                .direction(Direction::Vertical(
+                    Scrollbar::new()
+                        .width(4.0)
+                        .scroller_width(4.0)
+                        .padding(2.0)
+                        // Sit the bar beside the rows, instead of on top of the add buttons.
+                        .spacing(10.0),
+                ))
                 .height(LIST_HEIGHT),
         )
         .into()
