@@ -129,15 +129,18 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         None => logo(icon_size).into(),
     };
 
-    let content = if horizontal && state.config.show_track && state.item().is_some() {
-        playing_chip(state, cover_size, cover)
-    } else {
-        Row::new()
-            .spacing(8)
-            .align_y(Alignment::Center)
-            .push(cover)
-            .into()
-    };
+    // Spotify drops the item after a pause or a hiccup. The bar keeps the last
+    // one so it does not collapse to the cover and grow back a moment later.
+    let content =
+        if horizontal && connected && state.config.show_track && state.shown_item().is_some() {
+            playing_chip(state, cover_size, cover)
+        } else {
+            Row::new()
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .push(cover)
+                .into()
+        };
 
     let content = container(content)
         .height(cover_size)
@@ -159,7 +162,7 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
 
 /// Title line for the bar: song, then the artist after a dot.
 fn track_label(state: &Window) -> String {
-    let Some(item) = state.item() else {
+    let Some(item) = state.shown_item() else {
         return String::new();
     };
     if item.subtitle.is_empty() {
@@ -187,34 +190,20 @@ fn playing_chip<'a>(
     cover_size: f32,
     cover: Element<'a, Message>,
 ) -> Element<'a, Message> {
-    let playing = state.is_playing();
-    let trail = match state.config.panel_look {
-        PanelLook::Cover => scrolling_label(state, cover_size),
-        PanelLook::Bars => scope(
-            look::ScopeKind::Bars,
-            PANEL_LABEL_WIDTH,
-            cover_size,
-            playing,
-        ),
-        PanelLook::Wave => scope(
-            look::ScopeKind::Wave,
-            PANEL_LABEL_WIDTH,
-            cover_size,
-            playing,
-        ),
-        PanelLook::Fill => scope(
-            look::ScopeKind::Fill,
-            PANEL_LABEL_WIDTH,
-            cover_size,
-            playing,
-        ),
+    let kind = match state.config.panel_look {
+        PanelLook::Cover => {
+            return Row::new()
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .push(cover)
+                .push(scrolling_label(state, cover_size))
+                .into();
+        }
+        PanelLook::Bars => look::ScopeKind::Bars,
+        PanelLook::Wave => look::ScopeKind::Wave,
+        PanelLook::Fill => look::ScopeKind::Fill,
     };
-    Row::new()
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .push(cover)
-        .push(trail)
-        .into()
+    scope(kind, PANEL_LABEL_WIDTH, cover_size, state.is_playing())
 }
 
 // ---------------------------------------------------------------- popup
@@ -536,11 +525,18 @@ fn transport(state: &Window) -> Element<'_, Message> {
     let shuffle = player.is_some_and(|player| player.shuffle);
     let repeat = player.map_or(Repeat::Off, |player| player.repeat);
 
-    let small = |name: &'static str, tooltip: &'static str, message: Message, selected: bool| {
+    let small = |name: &'static str, tooltip: &'static str, message: Message| {
         button::icon(icon::from_name(name))
-            .selected(selected)
             .tooltip(tooltip)
             .on_press_maybe(active.then_some(message))
+    };
+    // The icon style drops `selected`, so a mode that is on paints itself in the accent.
+    let mode = |name: &'static str, tip: &'static str, message: Message, on: bool| {
+        let button = button::custom(icon::from_name(name).size(16))
+            .padding(8)
+            .class(toggle_class(on))
+            .on_press_maybe(active.then_some(message));
+        Element::from(tooltip(button, text::body(tip), tooltip::Position::Top))
     };
 
     let play_icon = if state.is_playing() {
@@ -553,15 +549,15 @@ fn transport(state: &Window) -> Element<'_, Message> {
         .class(theme::Button::Standard)
         .on_press(Message::PlayPause);
 
-    let repeat_icon = if repeat == Repeat::Track {
-        "media-playlist-repeat-song-symbolic"
-    } else {
-        "media-playlist-repeat-symbolic"
+    let (repeat_icon, repeat_tip) = match repeat {
+        Repeat::Off => ("media-playlist-consecutive-symbolic", "Repetir: no"),
+        Repeat::Context => ("media-playlist-repeat-symbolic", "Repetir: todo"),
+        Repeat::Track => ("media-playlist-repeat-song-symbolic", "Repetir: canción"),
     };
-    let repeat_tip = match repeat {
-        Repeat::Off => "Repetir: no",
-        Repeat::Context => "Repetir: todo",
-        Repeat::Track => "Repetir: canción",
+    let shuffle_tip = if shuffle {
+        "Aleatorio: sí"
+    } else {
+        "Aleatorio: no"
     };
 
     let volume = state.volume();
@@ -586,9 +582,9 @@ fn transport(state: &Window) -> Element<'_, Message> {
     Row::new()
         .spacing(2)
         .align_y(Alignment::Center)
-        .push(small(
+        .push(mode(
             "media-playlist-shuffle-symbolic",
-            "Aleatorio",
+            shuffle_tip,
             Message::ToggleShuffle,
             shuffle,
         ))
@@ -596,16 +592,14 @@ fn transport(state: &Window) -> Element<'_, Message> {
             "media-skip-backward-symbolic",
             "Anterior",
             Message::Previous,
-            false,
         ))
         .push(play)
         .push(small(
             "media-skip-forward-symbolic",
             "Siguiente",
             Message::Next,
-            false,
         ))
-        .push(small(
+        .push(mode(
             repeat_icon,
             repeat_tip,
             Message::CycleRepeat,
@@ -618,12 +612,11 @@ fn transport(state: &Window) -> Element<'_, Message> {
 
 // ---------------------------------------------------------------- library
 
-/// The icon button style drops the accent, so the heart is drawn on its own
-/// and tinted with the system accent while the track is saved.
+/// The icon button style drops the accent, so the heart is drawn on its own.
 fn save_button(saved: bool) -> Element<'static, Message> {
     let button = button::custom(icon::from_name("emblem-favorite-symbolic").size(16))
         .padding(4)
-        .class(heart_class(saved))
+        .class(toggle_class(saved))
         .on_press(Message::ToggleSaved);
     tooltip(
         button,
@@ -637,31 +630,32 @@ fn save_button(saved: bool) -> Element<'static, Message> {
     .into()
 }
 
-fn heart_class(saved: bool) -> theme::Button {
+/// An icon button tinted with the system accent while `on`.
+fn toggle_class(on: bool) -> theme::Button {
     theme::Button::Custom {
-        active: Box::new(move |focused, theme| heart_look(theme, focused, saved, Heart::Idle)),
-        hovered: Box::new(move |focused, theme| heart_look(theme, focused, saved, Heart::Hover)),
-        pressed: Box::new(move |focused, theme| heart_look(theme, focused, saved, Heart::Press)),
-        disabled: Box::new(|theme| heart_look(theme, false, false, Heart::Off)),
+        active: Box::new(move |focused, theme| toggle_look(theme, focused, on, Press::Idle)),
+        hovered: Box::new(move |focused, theme| toggle_look(theme, focused, on, Press::Hover)),
+        pressed: Box::new(move |focused, theme| toggle_look(theme, focused, on, Press::Down)),
+        disabled: Box::new(|theme| toggle_look(theme, false, false, Press::Off)),
     }
 }
 
 #[derive(Clone, Copy)]
-enum Heart {
+enum Press {
     Idle,
     Hover,
-    Press,
+    Down,
     Off,
 }
 
-fn heart_look(theme: &cosmic::Theme, focused: bool, saved: bool, heart: Heart) -> button::Style {
-    let mut style = match heart {
-        Heart::Idle => theme.active(focused, false, &theme::Button::Icon),
-        Heart::Hover => theme.hovered(focused, false, &theme::Button::Icon),
-        Heart::Press => theme.pressed(focused, false, &theme::Button::Icon),
-        Heart::Off => theme.disabled(&theme::Button::Icon),
+fn toggle_look(theme: &cosmic::Theme, focused: bool, on: bool, press: Press) -> button::Style {
+    let mut style = match press {
+        Press::Idle => theme.active(focused, false, &theme::Button::Icon),
+        Press::Hover => theme.hovered(focused, false, &theme::Button::Icon),
+        Press::Down => theme.pressed(focused, false, &theme::Button::Icon),
+        Press::Off => theme.disabled(&theme::Button::Icon),
     };
-    if saved {
+    if on {
         style.icon_color = Some(Color::from(theme.cosmic().accent_color()));
     }
     style

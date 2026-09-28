@@ -9,10 +9,15 @@ use cosmic::widget::segmented_button::{Entity, SingleSelectModel};
 use cosmic::{Action, Task};
 
 use crate::art;
-use crate::spotify::{self, Device, Entry, EntryKind, SearchGroup, Session, Spotify};
+use crate::spotify::{
+    self, Device, Entry, EntryKind, Item, ItemKind, SearchGroup, Session, Spotify,
+};
 use crate::window::{Message, Window, delayed};
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
+/// Recently played is fetched again after this, or as soon as the track changes.
+const RECENT_REFRESH: Duration = Duration::from_secs(30);
+const RECENT_KEEP: usize = 30;
 const NOTICE_FOR: Duration = Duration::from_secs(3);
 /// Thumbnails are small, but a long browsing session should not keep them all.
 const MAX_THUMBS: usize = 600;
@@ -75,6 +80,13 @@ pub struct Library {
     search_generation: u64,
     pub results: Load<Vec<SearchGroup>>,
     pub recent: Load<Vec<Entry>>,
+    /// Tracks heard this session, newest first. Spotify's history omits
+    /// whatever is still playing, so these stay at the top.
+    heard: Vec<Entry>,
+    recent_at: Option<std::time::Instant>,
+    recent_generation: u64,
+    /// The track changed, so play history may have a new row.
+    recent_dirty: bool,
     pub queue: Load<Vec<Entry>>,
     queue_generation: u64,
     /// Tracks just removed, so a stale reload cannot put them back.
@@ -113,6 +125,10 @@ impl Default for Library {
             search_generation: 0,
             results: Load::Idle,
             recent: Load::Idle,
+            heard: Vec::new(),
+            recent_at: None,
+            recent_generation: 0,
+            recent_dirty: false,
             queue: Load::Idle,
             queue_generation: 0,
             dropped: Vec::new(),
@@ -147,6 +163,45 @@ impl Library {
         self.scroll.get(&self.scroll_key()).copied().unwrap_or(0.0)
     }
 
+    pub(crate) fn mark_recent_dirty(&mut self) {
+        self.recent_dirty = true;
+    }
+
+    /// Puts the track on screen at the top of recently played, right away.
+    pub(crate) fn remember_item(&mut self, item: &Item) {
+        let entry = Entry {
+            kind: match item.kind {
+                ItemKind::Track => EntryKind::Track,
+                ItemKind::Episode => EntryKind::Episode,
+            },
+            id: item.id.clone(),
+            uri: item.uri.clone(),
+            name: item.name.clone(),
+            detail: item.subtitle.clone(),
+            parent_uri: item.parent_uri.clone(),
+            duration_ms: item.duration_ms,
+            art_url: item.art_url.clone(),
+            playable: true,
+        };
+        self.heard.retain(|existing| existing.uri != entry.uri);
+        self.heard.insert(0, entry);
+        self.heard.truncate(RECENT_KEEP);
+        let server = match &self.recent {
+            Load::Ready(list) => list.clone(),
+            _ => Vec::new(),
+        };
+        self.recent = Load::Ready(compose_recent(&self.heard, &server));
+    }
+
+    /// True when play history was never loaded, went stale, or the track changed.
+    fn recent_needs_refresh(&self) -> bool {
+        matches!(self.recent, Load::Idle | Load::Failed(_))
+            || self.recent_dirty
+            || self
+                .recent_at
+                .is_none_or(|at| at.elapsed() > RECENT_REFRESH)
+    }
+
     /// Drops one copy of each track the user just removed, if Spotify still lists it.
     fn without_dropped(&mut self, mut entries: Vec<Entry>) -> Vec<Entry> {
         let now = std::time::Instant::now();
@@ -158,6 +213,39 @@ impl Library {
         }
         entries
     }
+}
+
+/// What should follow `uri`. Picked from the queue itself, the rows before it
+/// were skipped; picked elsewhere, the whole queue still follows.
+fn queue_after(upcoming: &[Entry], uri: &str, from_queue: bool) -> Vec<String> {
+    let start = if from_queue {
+        upcoming
+            .iter()
+            .position(|entry| entry.uri == uri)
+            .map_or(0, |at| at + 1)
+    } else {
+        0
+    };
+    upcoming[start..]
+        .iter()
+        .filter(|entry| entry.uri != uri)
+        .map(|entry| entry.uri.clone())
+        .collect()
+}
+
+/// Heard tracks first, then Spotify's history, each URI once.
+fn compose_recent(heard: &[Entry], server: &[Entry]) -> Vec<Entry> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for entry in heard.iter().chain(server.iter()) {
+        if seen.insert(entry.uri.clone()) {
+            out.push(entry.clone());
+            if out.len() == RECENT_KEEP {
+                break;
+            }
+        }
+    }
+    out
 }
 
 impl Tab {
@@ -179,7 +267,7 @@ pub enum Browse {
     SubmitSearch,
     ClearSearch,
     SearchLoaded(u64, Result<Vec<SearchGroup>, spotify::Error>),
-    RecentLoaded(Result<Vec<Entry>, spotify::Error>),
+    RecentLoaded(u64, Result<Vec<Entry>, spotify::Error>),
     PlaylistsLoaded(Result<(Vec<Entry>, u64), spotify::Error>),
     QueueLoaded(u64, Result<Vec<Entry>, spotify::Error>),
     ShowsLoaded(Result<Vec<Entry>, spotify::Error>),
@@ -284,9 +372,23 @@ impl Window {
                 self.library.results = Load::from_result(result);
                 return self.enqueue_thumbs();
             }
-            Browse::RecentLoaded(result) => {
+            Browse::RecentLoaded(generation, result) => {
+                if generation != self.library.recent_generation {
+                    return Task::none();
+                }
+                self.library.recent_at = Some(std::time::Instant::now());
                 self.note_error(&result);
-                self.library.recent = Load::from_result(result);
+                match result {
+                    Ok(entries) => {
+                        self.library.recent =
+                            Load::Ready(compose_recent(&self.library.heard, &entries));
+                    }
+                    Err(error) => {
+                        if !matches!(self.library.recent, Load::Ready(_)) {
+                            self.library.recent = Load::Failed(error.to_string());
+                        }
+                    }
+                }
                 return self.enqueue_thumbs();
             }
             Browse::PlaylistsLoaded(result) => {
@@ -463,13 +565,17 @@ impl Window {
         let library = &mut self.library;
         match library.tab {
             Tab::Search if library.query.trim().is_empty() => {
-                if matches!(library.recent, Load::Idle) {
-                    library.recent = Load::Loading;
-                    return fetch(
-                        spotify,
-                        |spotify| async move { spotify.recent().await },
-                        Browse::RecentLoaded,
-                    );
+                if library.recent_needs_refresh() {
+                    let idle = matches!(library.recent, Load::Idle | Load::Failed(_));
+                    library.recent_generation = library.recent_generation.wrapping_add(1);
+                    library.recent_dirty = false;
+                    if idle {
+                        library.recent = Load::Loading;
+                    }
+                    let generation = library.recent_generation;
+                    return Task::perform(async move { spotify.recent().await }, move |result| {
+                        browse(Browse::RecentLoaded(generation, result))
+                    });
                 }
             }
             Tab::Search => {}
@@ -552,14 +658,29 @@ impl Window {
         if entry.kind == EntryKind::Artist {
             return self.update_browse(Browse::PlayContext(entry));
         }
-        if let Some(context) = entry.parent_uri {
-            let offset = entry.uri;
-            return self.command(move |spotify| async move {
-                spotify.play_context(&context, Some(&offset)).await
-            });
-        }
-        let uris = vec![entry.uri];
-        self.command(move |spotify| async move { spotify.play_uris(&uris).await })
+        self.play_before_queue(entry)
+    }
+
+    /// Plays a single track and then whatever the queue already had, so the
+    /// next button does not drop into that track's album or stop.
+    fn play_before_queue(&mut self, entry: Entry) -> Task<Action<Message>> {
+        let from_queue = self.library.tab == Tab::Queue;
+        let uri = entry.uri;
+        let parent = entry.parent_uri;
+        self.library.queue = Load::Idle;
+        self.command(move |spotify| async move {
+            let upcoming = spotify.playback_queue().await.unwrap_or_default();
+            let after = queue_after(&upcoming, &uri, from_queue);
+            if after.is_empty()
+                && let Some(context) = parent
+            {
+                return spotify.play_context(&context, Some(&uri)).await;
+            }
+            let mut uris = Vec::with_capacity(after.len() + 1);
+            uris.push(uri);
+            uris.extend(after);
+            spotify.play_uris(&uris).await
+        })
     }
 
     fn open(&mut self, source: Source) -> Task<Action<Message>> {
@@ -634,7 +755,7 @@ impl Window {
                             if entry.kind == EntryKind::Playlist
                     );
                     detail.items = Load::Failed(if blocked {
-                        "Spotify no deja ver las canciones de una playlist que no es tuya ni en la que colaborás. Pero aún así, podés reproducirla.".into()
+                        "Por limitaciones y restricciones de la API de Spotify, no puedo mostrarte las canciones. No te preocupes, podés reproducirlas y verlas en la sección Cola.".into()
                     } else {
                         error.to_string()
                     });
@@ -882,6 +1003,53 @@ impl Window {
 mod tests {
     use super::*;
     use crate::spotify::{Entry, EntryKind};
+
+    #[test]
+    fn recent_refreshes_once_it_is_stale_or_the_track_moved_on() {
+        let mut library = Library::default();
+        assert!(library.recent_needs_refresh());
+        library.recent = Load::Ready(Vec::new());
+        library.recent_at = Some(std::time::Instant::now());
+        assert!(!library.recent_needs_refresh());
+        library.recent_dirty = true;
+        assert!(library.recent_needs_refresh());
+    }
+
+    #[test]
+    fn a_track_just_played_stays_ahead_of_spotifys_history() {
+        let mut library = Library::default();
+        library.remember_item(&played("spotify:track:nueva", "Nueva"));
+        let Load::Ready(list) = &library.recent else {
+            panic!("recent list");
+        };
+        assert_eq!(list[0].name, "Nueva");
+        let merged = compose_recent(&library.heard, &[entry("spotify:track:vieja")]);
+        assert_eq!(merged[0].uri, "spotify:track:nueva");
+        assert_eq!(merged[1].uri, "spotify:track:vieja");
+    }
+
+    #[test]
+    fn a_picked_track_is_followed_by_the_queue() {
+        let queue = [entry("a"), entry("b"), entry("c")];
+        assert_eq!(queue_after(&queue, "x", false), ["a", "b", "c"]);
+        assert_eq!(queue_after(&queue, "b", false), ["a", "c"]);
+        assert_eq!(queue_after(&queue, "b", true), ["c"]);
+        assert!(queue_after(&[], "x", false).is_empty());
+    }
+
+    fn played(uri: &str, name: &str) -> crate::spotify::Item {
+        crate::spotify::Item {
+            kind: crate::spotify::ItemKind::Track,
+            id: String::new(),
+            uri: uri.to_owned(),
+            name: name.to_owned(),
+            subtitle: String::new(),
+            album: String::new(),
+            parent_uri: None,
+            duration_ms: 0,
+            art_url: None,
+        }
+    }
 
     #[test]
     fn each_list_keeps_its_own_scroll() {

@@ -27,6 +27,11 @@ fn state_dir() -> PathBuf {
     xdg("XDG_STATE_HOME", ".local/state").join(APP_DIR)
 }
 
+/// A small file of the applet's own under the state directory.
+pub fn state_file(name: &str) -> PathBuf {
+    state_dir().join(name)
+}
+
 fn credentials_dir() -> PathBuf {
     state_dir().join("player")
 }

@@ -43,13 +43,13 @@ impl Repeat {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ItemKind {
     Track,
     Episode,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub kind: ItemKind,
     pub id: String,
@@ -58,6 +58,9 @@ pub struct Item {
     /// Artists for a track, the show for an episode.
     pub subtitle: String,
     pub album: String,
+    /// Album or show the item belongs to, so play can carry on after it.
+    #[serde(default)]
+    pub parent_uri: Option<String>,
     pub duration_ms: u64,
     pub art_url: Option<String>,
 }
@@ -146,6 +149,8 @@ struct RawNamed {
 #[derive(Deserialize)]
 struct RawAlbum {
     #[serde(default)]
+    uri: String,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     images: Vec<RawImage>,
@@ -153,6 +158,8 @@ struct RawAlbum {
 
 #[derive(Deserialize)]
 struct RawShow {
+    #[serde(default)]
+    uri: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -215,7 +222,7 @@ impl From<RawDevice> for Device {
 
 impl Item {
     fn from_raw(raw: RawItem) -> Option<Self> {
-        let (kind, subtitle, album, images) = match raw.kind.as_str() {
+        let (kind, subtitle, album, parent_uri, images) = match raw.kind.as_str() {
             "track" => {
                 let artists = raw
                     .artists
@@ -224,23 +231,23 @@ impl Item {
                     .filter(|name| !name.is_empty())
                     .collect::<Vec<_>>()
                     .join(", ");
-                let (album, images) = raw
+                let (album, parent, images) = raw
                     .album
-                    .map(|album| (album.name, album.images))
+                    .map(|album| (album.name, album.uri, album.images))
                     .unwrap_or_default();
-                (ItemKind::Track, artists, album, images)
+                (ItemKind::Track, artists, album, parent, images)
             }
             "episode" => {
-                let (show, show_images) = raw
+                let (show, parent, show_images) = raw
                     .show
-                    .map(|show| (show.name, show.images))
+                    .map(|show| (show.name, show.uri, show.images))
                     .unwrap_or_default();
                 let images = if raw.images.is_empty() {
                     show_images
                 } else {
                     raw.images
                 };
-                (ItemKind::Episode, show, String::new(), images)
+                (ItemKind::Episode, show, String::new(), parent, images)
             }
             _ => return None,
         };
@@ -252,6 +259,7 @@ impl Item {
             name: raw.name,
             subtitle,
             album,
+            parent_uri: Some(parent_uri).filter(|uri| !uri.is_empty()),
             duration_ms: raw.duration_ms.unwrap_or_default(),
             art_url: pick_image(&images, ART_SIZE),
         })

@@ -21,7 +21,7 @@ use cosmic::{Action, Element, Task};
 use crate::art::{self, Artwork};
 use crate::browse::{Browse, Library};
 use crate::config::{self, AppConfig, PanelLook};
-use crate::spotify::{self, Item, PlayerState, Session, Spotify, Store, User};
+use crate::spotify::{self, Item, PlayerState, Repeat, Session, Spotify, Store, User};
 use crate::{browser, player, ui};
 
 pub const APP_ID: &str = "io.github.gbazan92.CosmicExtAppletSpotify";
@@ -34,6 +34,8 @@ const SETTLE: Duration = Duration::from_millis(700);
 const VOLUME_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How long the slider keeps the value the user chose while Spotify catches up.
 const VOLUME_HOLD: Duration = Duration::from_secs(3);
+/// Same wait for play, pause, shuffle and the other controls.
+const CONTROL_HOLD: Duration = Duration::from_secs(3);
 /// Touchpads report pixels; this many make one wheel notch.
 const PIXELS_PER_NOTCH: f32 = 40.0;
 
@@ -83,6 +85,8 @@ pub struct Window {
     volume_generation: u64,
     /// Value shown on the slider until a poll reports the same number.
     volume_held: Option<(u8, Instant)>,
+    /// Controls kept as the user left them until a poll agrees.
+    playback_held: Option<PlaybackHold>,
     /// Progress kept on screen while a queue edit restarts playback underneath.
     progress_held: Option<(u64, Instant, bool)>,
     volume_before_mute: Option<u8>,
@@ -142,6 +146,77 @@ pub enum Message {
     DisablePlayback,
 }
 
+/// What the user just did, kept on screen while an older poll is still in flight.
+#[derive(Clone, Debug)]
+struct PlaybackHold {
+    at: Instant,
+    playing: Option<bool>,
+    shuffle: Option<bool>,
+    repeat: Option<Repeat>,
+    /// Track that was on screen when skip was pressed. A later poll that still
+    /// names it must not replace the track Spotify already moved on from.
+    left_uri: Option<String>,
+    saved: Option<bool>,
+}
+
+impl PlaybackHold {
+    fn touch() -> Self {
+        Self {
+            at: Instant::now(),
+            playing: None,
+            shuffle: None,
+            repeat: None,
+            left_uri: None,
+            saved: None,
+        }
+    }
+
+    fn fresh(&self) -> bool {
+        self.at.elapsed() <= CONTROL_HOLD
+    }
+
+    fn is_empty(&self) -> bool {
+        self.playing.is_none()
+            && self.shuffle.is_none()
+            && self.repeat.is_none()
+            && self.left_uri.is_none()
+            && self.saved.is_none()
+    }
+
+    /// Paints the chosen controls over a poll and drops each one once it matches.
+    fn overlay(&mut self, player: &mut PlayerState) {
+        if let Some(playing) = self.playing {
+            if player.is_playing == playing {
+                self.playing = None;
+            } else {
+                player.is_playing = playing;
+            }
+        }
+        if let Some(shuffle) = self.shuffle {
+            if player.shuffle == shuffle {
+                self.shuffle = None;
+            } else {
+                player.shuffle = shuffle;
+            }
+        }
+        if let Some(repeat) = self.repeat {
+            if player.repeat == repeat {
+                self.repeat = None;
+            } else {
+                player.repeat = repeat;
+            }
+        }
+    }
+
+    /// A poll of the track we already skipped, after the new one is on screen.
+    fn stale_track(&self, incoming: Option<&str>, shown: Option<&str>) -> bool {
+        match (self.left_uri.as_deref(), incoming, shown) {
+            (Some(left), Some(incoming), Some(shown)) => incoming == left && shown != left,
+            _ => false,
+        }
+    }
+}
+
 impl cosmic::Application for Window {
     type Executor = cosmic::executor::Default;
     type Flags = ();
@@ -178,7 +253,7 @@ impl cosmic::Application for Window {
             player: None,
             fetched_at: Instant::now(),
             loaded: false,
-            last_item: None,
+            last_item: load_last_item(),
             error,
             saved: None,
             saved_uri: String::new(),
@@ -187,6 +262,7 @@ impl cosmic::Application for Window {
             seek_drag: None,
             volume_generation: 0,
             volume_held: None,
+            playback_held: None,
             progress_held: None,
             volume_before_mute: None,
             scroll_notches: 0.0,
@@ -297,6 +373,7 @@ impl cosmic::Application for Window {
                 self.session = Session::SignedOut;
                 self.player = None;
                 self.last_item = None;
+                let _ = std::fs::remove_file(player::state_file(LAST_ITEM_FILE));
                 self.artwork = None;
                 self.saved = None;
                 self.saved_uri.clear();
@@ -350,11 +427,17 @@ impl cosmic::Application for Window {
             }
             Message::PlayerLoaded(result) => match *result {
                 Ok(player) => return self.apply_player(player),
+                // A poll that hiccups keeps what is on screen; the next one retries.
+                Err(
+                    error @ (spotify::Error::Network(_)
+                    | spotify::Error::Server(_)
+                    | spotify::Error::RateLimited { .. }),
+                ) if self.loaded => eprintln!("player poll failed: {error}"),
                 Err(error) => self.handle_api_error(&error),
             },
             Message::SavedLoaded(uri, result) => {
                 if uri == self.saved_uri {
-                    self.saved = result.ok();
+                    self.saved = self.kept_saved(result.ok());
                 }
             }
             Message::ArtLoaded(url, result) => {
@@ -375,14 +458,19 @@ impl cosmic::Application for Window {
                 if let Some(player) = self.player.as_mut() {
                     player.is_playing = !playing;
                 }
+                self.playback_hold().playing = Some(!playing);
                 return if playing {
                     self.command(|spotify| async move { spotify.pause().await })
                 } else {
                     self.command(|spotify| async move { spotify.play().await })
                 };
             }
-            Message::Next => return self.command(|spotify| async move { spotify.next().await }),
+            Message::Next => {
+                self.hold_skipped_track();
+                return self.command(|spotify| async move { spotify.next().await });
+            }
             Message::Previous => {
+                self.hold_skipped_track();
                 return self.command(|spotify| async move { spotify.previous().await });
             }
             Message::ToggleShuffle => {
@@ -391,6 +479,7 @@ impl cosmic::Application for Window {
                 };
                 player.shuffle = !player.shuffle;
                 let on = player.shuffle;
+                self.playback_hold().shuffle = Some(on);
                 return self.command(move |spotify| async move { spotify.set_shuffle(on).await });
             }
             Message::CycleRepeat => {
@@ -399,6 +488,7 @@ impl cosmic::Application for Window {
                 };
                 player.repeat = player.repeat.next();
                 let mode = player.repeat;
+                self.playback_hold().repeat = Some(mode);
                 return self.command(move |spotify| async move { spotify.set_repeat(mode).await });
             }
             Message::ToggleSaved => {
@@ -407,6 +497,7 @@ impl cosmic::Application for Window {
                 };
                 let save = !self.saved.unwrap_or(false);
                 self.saved = Some(save);
+                self.playback_hold().saved = Some(save);
                 return self.command(move |spotify| async move {
                     if save {
                         spotify.save(&uri).await
@@ -430,6 +521,7 @@ impl cosmic::Application for Window {
                     player.progress_ms = position;
                 }
                 self.fetched_at = Instant::now();
+                self.hold_progress();
                 return self.command(move |spotify| async move { spotify.seek(position).await });
             }
             Message::SetVolume(volume) => return self.set_volume(volume),
@@ -456,8 +548,19 @@ impl cosmic::Application for Window {
             }
             Message::Scroll(delta) => return self.scroll_volume(delta),
             Message::CommandDone(result) => {
-                if let Err(error) = result {
-                    self.handle_api_error(&error);
+                if let Err(error) = &result {
+                    // The optimistic icon was a guess. Let the next poll show
+                    // what Spotify actually did.
+                    self.playback_held = None;
+                    // Play, pause and the rest often fail while Spotify is
+                    // catching up, then the next poll is fine. That used to
+                    // flash the red status under the title.
+                    match error {
+                        spotify::Error::Reauth | spotify::Error::SignedOut => {
+                            self.handle_api_error(error);
+                        }
+                        other => eprintln!("player command failed: {other}"),
+                    }
                 }
                 return self.refresh_player();
             }
@@ -530,6 +633,11 @@ impl Window {
         self.player.as_ref().and_then(|player| player.item.as_ref())
     }
 
+    /// What the panel shows: the current track, else the last one heard.
+    pub(crate) fn shown_item(&self) -> Option<&Item> {
+        self.item().or(self.last_item.as_ref())
+    }
+
     pub(crate) fn is_playing(&self) -> bool {
         self.player
             .as_ref()
@@ -593,6 +701,50 @@ impl Window {
             player.progress_ms = progress;
         }
         self.fetched_at = Instant::now();
+    }
+
+    fn playback_hold(&mut self) -> &mut PlaybackHold {
+        if self.playback_held.as_ref().is_none_or(|hold| !hold.fresh()) {
+            self.playback_held = Some(PlaybackHold::touch());
+        }
+        let hold = self
+            .playback_held
+            .as_mut()
+            .expect("playback hold was just inserted");
+        hold.at = Instant::now();
+        hold
+    }
+
+    fn hold_skipped_track(&mut self) {
+        let Some(uri) = self.item().map(|item| item.uri.clone()) else {
+            return;
+        };
+        self.playback_hold().left_uri = Some(uri);
+    }
+
+    /// Keeps the heart as toggled when an older save-check comes back.
+    fn kept_saved(&mut self, reported: Option<bool>) -> Option<bool> {
+        let fresh = self.playback_held.as_ref().is_some_and(PlaybackHold::fresh);
+        if self.playback_held.is_some() && !fresh {
+            self.playback_held = None;
+            return reported;
+        }
+        let Some(want) = self.playback_held.as_ref().and_then(|hold| hold.saved) else {
+            return reported;
+        };
+        if reported == Some(want) {
+            if let Some(hold) = self.playback_held.as_mut() {
+                hold.saved = None;
+            }
+            if self
+                .playback_held
+                .as_ref()
+                .is_some_and(PlaybackHold::is_empty)
+            {
+                self.playback_held = None;
+            }
+        }
+        Some(want)
     }
 
     /// Keeps the progress bar still while Spotify restarts the same track.
@@ -807,6 +959,27 @@ impl Window {
                 device.volume = Some(held);
             }
         }
+        let shown_uri = self.item().map(|item| item.uri.clone());
+        let mut drop_hold = false;
+        let mut stale_track = false;
+        if let Some(hold) = self.playback_held.as_mut() {
+            if !hold.fresh() {
+                drop_hold = true;
+            } else if let Some(incoming) = player.as_mut() {
+                stale_track = hold.stale_track(
+                    incoming.item.as_ref().map(|item| item.uri.as_str()),
+                    shown_uri.as_deref(),
+                );
+                hold.overlay(incoming);
+                drop_hold = hold.is_empty();
+            }
+        }
+        if drop_hold {
+            self.playback_held = None;
+        }
+        if stale_track {
+            return Task::none();
+        }
         if let Some((held, at, playing)) = self.progress_held {
             let elapsed = u64::try_from(at.elapsed().as_millis()).unwrap_or(0);
             let expected = if playing {
@@ -834,11 +1007,20 @@ impl Window {
         self.fetched_at = Instant::now();
         self.loaded = true;
         self.error = None;
-        if let Some(item) = self.item() {
-            self.last_item = Some(item.clone());
+        if let Some(item) = self.item().cloned()
+            && self.last_item.as_ref() != Some(&item)
+        {
+            save_last_item(&item);
+            self.last_item = Some(item);
         }
 
         let mut tasks = Vec::new();
+        if let Some(item) = self.item().cloned()
+            && shown_uri.as_deref() != Some(item.uri.as_str())
+        {
+            self.library.remember_item(&item);
+            tasks.push(self.note_recent_stale());
+        }
         if let Some(uri) = self.item().map(|item| item.uri.clone())
             && uri != self.saved_uri
         {
@@ -854,6 +1036,20 @@ impl Window {
             tasks.push(self.load_art(url));
         }
         Task::batch(tasks)
+    }
+
+    /// Play history only grows once a track has moved on, so mark it dirty then.
+    fn note_recent_stale(&mut self) -> Task<Action<Message>> {
+        self.library.mark_recent_dirty();
+        let showing = self.popup.is_some()
+            && self.library.detail.is_none()
+            && self.library.tab == crate::browse::Tab::Search
+            && self.library.query.trim().is_empty();
+        if showing {
+            self.ensure_library()
+        } else {
+            Task::none()
+        }
     }
 
     fn check_saved(&self, uri: String) -> Task<Action<Message>> {
@@ -1035,6 +1231,27 @@ impl Window {
     }
 }
 
+const LAST_ITEM_FILE: &str = "last-item.json";
+
+/// The track the panel showed before a restart, so it does not come up empty.
+fn load_last_item() -> Option<Item> {
+    let bytes = std::fs::read(player::state_file(LAST_ITEM_FILE)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_last_item(item: &Item) {
+    let path = player::state_file(LAST_ITEM_FILE);
+    let Ok(bytes) = serde_json::to_vec(item) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(error) = std::fs::write(&path, bytes) {
+        eprintln!("unable to remember the last track: {error}");
+    }
+}
+
 pub(crate) fn delayed(after: Duration, message: Message) -> Task<Action<Message>> {
     Task::perform(tokio::time::sleep(after), move |()| {
         Action::App(message.clone())
@@ -1048,4 +1265,43 @@ fn px(value: f32) -> u32 {
 
 fn surface_task(action: cosmic::surface::Action) -> Task<Action<Message>> {
     cosmic::task::message(cosmic::Action::Cosmic(cosmic::app::Action::Surface(action)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn player(playing: bool) -> PlayerState {
+        PlayerState {
+            is_playing: playing,
+            progress_ms: 0,
+            shuffle: false,
+            repeat: Repeat::Off,
+            device: None,
+            item: None,
+        }
+    }
+
+    #[test]
+    fn a_stale_poll_does_not_undo_pause() {
+        let mut hold = PlaybackHold::touch();
+        hold.playing = Some(false);
+        let mut incoming = player(true);
+        hold.overlay(&mut incoming);
+        assert!(!incoming.is_playing);
+        assert_eq!(hold.playing, Some(false));
+
+        incoming.is_playing = false;
+        hold.overlay(&mut incoming);
+        assert!(hold.playing.is_none());
+    }
+
+    #[test]
+    fn a_skipped_track_does_not_come_back() {
+        let mut hold = PlaybackHold::touch();
+        hold.left_uri = Some("spotify:track:a".into());
+        assert!(hold.stale_track(Some("spotify:track:a"), Some("spotify:track:b")));
+        assert!(!hold.stale_track(Some("spotify:track:b"), Some("spotify:track:b")));
+        assert!(!hold.stale_track(Some("spotify:track:a"), Some("spotify:track:a")));
+    }
 }
