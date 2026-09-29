@@ -5,10 +5,12 @@
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::fl;
 
@@ -16,6 +18,10 @@ pub const BINARY: &str = "spotypop-player";
 const APP_DIR: &str = "spotypop";
 /// Exit code of `run` and `login` when the computer has no playback login.
 const NEEDS_LOGIN: i32 = 3;
+/// The receiver rewrites its heartbeat every 5 s, also while it waits to
+/// retry, and a connection attempt is capped at 20 s.
+const HEARTBEAT_STALE: Duration = Duration::from_secs(30);
+const STOP_GRACE: Duration = Duration::from_secs(3);
 
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     env::var_os(var)
@@ -47,8 +53,17 @@ fn runtime_dir() -> PathBuf {
         .join(APP_DIR)
 }
 
+/// A small file under the private runtime directory shared by every instance.
+pub fn runtime_file(name: &str) -> PathBuf {
+    runtime_dir().join(name)
+}
+
 fn pid_file() -> PathBuf {
     runtime_dir().join("player.pid")
+}
+
+fn health_file() -> PathBuf {
+    runtime_dir().join("player.health")
 }
 
 /// Where the receiver streams what is sounding; see `src/feed.rs`.
@@ -100,19 +115,23 @@ fn log_file(name: &str) -> Option<fs::File> {
 
 /// Starts the receiver in its own session so a panel restart does not take
 /// the music with it. A second instance notices the first and exits.
+///
+/// The receiver opens its log itself once it holds the instance lock; opening
+/// it here would truncate the log of the receiver that is already playing.
 pub fn start() -> Result<(), String> {
     let binary = binary().ok_or_else(|| fl!("player-not-found", binary = BINARY))?;
-    let stderr = log_file("player.log").map_or_else(Stdio::null, Stdio::from);
     let mut command = Command::new(binary);
     command
         .arg("run")
         .arg("--name")
         .arg(device_name())
+        .arg("--log")
+        .arg(state_file("player.log"))
         .env_remove("XDG_ACTIVATION_TOKEN")
         .env_remove("DESKTOP_STARTUP_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr);
+        .stderr(Stdio::null());
     // SAFETY: setsid is async-signal-safe and touches no memory.
     unsafe {
         command.pre_exec(|| {
@@ -147,8 +166,74 @@ fn running_pid() -> Option<libc::pid_t> {
     ours.then_some(pid)
 }
 
-pub fn running() -> bool {
-    running_pid().is_some()
+/// What the receiver is doing, as far as its heartbeat tells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Receiver {
+    Stopped,
+    /// Starting up, or waiting for Spotify or the network to come back.
+    Connecting,
+    Connected,
+    /// Alive but no longer writing its heartbeat.
+    Stuck,
+}
+
+fn unix_seconds(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// `heartbeat` is the health file's content; `claimed` is when the receiver
+/// wrote its pid file, which covers the moments before its first heartbeat.
+fn classify(heartbeat: Option<&str>, claimed: Option<u64>, now: u64) -> Receiver {
+    let fresh = |at: u64| now.saturating_sub(at) <= HEARTBEAT_STALE.as_secs();
+    let beat = heartbeat.and_then(|line| {
+        let (state, at) = line.trim().split_once(' ')?;
+        Some((state, at.parse::<u64>().ok()?))
+    });
+    match beat {
+        Some(("connected", at)) if fresh(at) => Receiver::Connected,
+        Some((_, at)) if fresh(at) => Receiver::Connecting,
+        _ if claimed.is_some_and(fresh) => Receiver::Connecting,
+        _ => Receiver::Stuck,
+    }
+}
+
+/// Whether some receiver holds the instance lock. Unlike the pid, this works
+/// across Flatpak sandboxes, whose pid namespaces hide each other's processes.
+/// The probe holds the lock for an instant; a receiver starting right then
+/// takes it for a duplicate and exits, and the next poll starts it again.
+fn lock_held() -> bool {
+    let Ok(file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(pid_file())
+    else {
+        return false;
+    };
+    // SAFETY: flock only reads the descriptor, which `file` keeps open;
+    // dropping `file` releases a lock the probe itself took.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 }
+}
+
+pub fn status() -> Receiver {
+    if !lock_held() {
+        return Receiver::Stopped;
+    }
+    let heartbeat = fs::read_to_string(health_file()).ok();
+    let claimed = fs::metadata(pid_file())
+        .and_then(|meta| meta.modified())
+        .ok()
+        .map(unix_seconds);
+    classify(
+        heartbeat.as_deref(),
+        claimed,
+        unix_seconds(SystemTime::now()),
+    )
+}
+
+fn alive(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks that the process exists.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 pub fn stop() {
@@ -158,6 +243,41 @@ pub fn stop() {
             libc::kill(pid, libc::SIGTERM);
         }
     }
+}
+
+/// Stops a receiver that stopped answering, killing it if SIGTERM is not
+/// enough, and starts a fresh one. Runs on its own thread because the wait
+/// would freeze the panel.
+pub fn restart() {
+    std::thread::spawn(|| {
+        if running_pid().is_none() && lock_held() {
+            eprintln!("the stuck receiver was started by another applet instance");
+            return;
+        }
+        if let Some(pid) = running_pid() {
+            // SAFETY: plain signal delivery to a process we verified.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            let step = Duration::from_millis(100);
+            let mut waited = Duration::ZERO;
+            while alive(pid) && waited < STOP_GRACE {
+                std::thread::sleep(step);
+                waited += step;
+            }
+            if alive(pid) {
+                eprintln!("receiver ignored SIGTERM; killing it");
+                // SAFETY: the pid verified above, a few seconds ago.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                std::thread::sleep(step);
+            }
+        }
+        if let Err(error) = start() {
+            eprintln!("{error}");
+        }
+    });
 }
 
 /// Stops the receiver and deletes its login.
@@ -222,5 +342,36 @@ mod tests {
     #[test]
     fn device_name_mentions_cosmic() {
         assert!(device_name().contains("COSMIC"));
+    }
+
+    #[test]
+    fn fresh_heartbeats_report_their_state() {
+        assert_eq!(
+            classify(Some("connected 1000\n"), Some(10), 1020),
+            Receiver::Connected
+        );
+        assert_eq!(
+            classify(Some("connecting 1000\n"), Some(10), 1020),
+            Receiver::Connecting
+        );
+    }
+
+    #[test]
+    fn a_silent_receiver_is_stuck_once_past_its_startup() {
+        assert_eq!(
+            classify(Some("connected 1000"), Some(10), 1031),
+            Receiver::Stuck
+        );
+        assert_eq!(classify(None, Some(10), 1000), Receiver::Stuck);
+        assert_eq!(classify(Some("garbage"), None, 1000), Receiver::Stuck);
+    }
+
+    #[test]
+    fn a_receiver_that_just_started_gets_time_to_report() {
+        assert_eq!(classify(None, Some(995), 1000), Receiver::Connecting);
+        assert_eq!(
+            classify(Some("connected 1"), Some(995), 1000),
+            Receiver::Connecting
+        );
     }
 }

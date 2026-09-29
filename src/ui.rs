@@ -267,12 +267,14 @@ fn player_view(state: &Window) -> Element<'_, Message> {
     let active = state.item().is_some();
 
     let status = match (active, device) {
+        _ if state.offline => fl!("offline"),
         (true, Some(device)) if state.is_playing() => {
             fl!("status-playing-on", device = device.name.as_str())
         }
         (true, Some(device)) => fl!("status-paused-on", device = device.name.as_str()),
         (true, None) => fl!("status-paused"),
         (false, _) if !state.loaded => fl!("status-loading"),
+        (false, _) if state.receiver_reconnecting() => fl!("receiver-reconnecting"),
         (false, _) => fl!("nothing-playing"),
     };
 
@@ -387,7 +389,9 @@ fn device_picker<'a>(state: &'a Window, devices: &'a Load<Vec<Device>>) -> Eleme
         Load::Idle | Load::Loading => placeholder_text(fl!("devices-searching")),
         Load::Failed(error) => text::caption(error.as_str()).class(ERROR).into(),
         Load::Ready(list) if list.is_empty() => {
-            placeholder_text(if state.playback == Playback::Ready {
+            placeholder_text(if state.receiver_reconnecting() {
+                fl!("receiver-reconnecting")
+            } else if state.playback == Playback::Ready {
                 fl!("devices-local-starting")
             } else {
                 fl!("devices-none")
@@ -519,7 +523,7 @@ fn hero(state: &Window) -> Element<'_, Message> {
 
 fn transport(state: &Window) -> Element<'_, Message> {
     let player = state.player.as_ref();
-    let active = state.item().is_some();
+    let active = state.item().is_some() && !state.offline;
     let shuffle = player.is_some_and(|player| player.shuffle);
     let repeat = player.map_or(Repeat::Off, |player| player.repeat);
 
@@ -545,7 +549,7 @@ fn transport(state: &Window) -> Element<'_, Message> {
     let play = button::custom(icon::from_name(play_icon).size(20))
         .padding([6, 16])
         .class(theme::Button::Standard)
-        .on_press(Message::PlayPause);
+        .on_press_maybe((!state.offline).then_some(Message::PlayPause));
 
     let (repeat_icon, repeat_tip) = match repeat {
         Repeat::Off => ("media-playlist-consecutive-symbolic", fl!("repeat-off")),
@@ -734,7 +738,7 @@ fn library(state: &Window) -> Element<'_, Message> {
 fn list_body(state: &Window) -> Element<'_, Message> {
     let library = &state.library;
     if let Some(detail) = &library.detail {
-        return entries_or(state, &detail.items, fl!("empty-list"), None, false);
+        return entries_or(state, &detail.items, fl!("empty-list"), None);
     }
     match library.tab {
         Tab::Search if library.query.trim().is_empty() => entries_or(
@@ -742,7 +746,6 @@ fn list_body(state: &Window) -> Element<'_, Message> {
             &library.recent,
             fl!("empty-recent"),
             Some(section_title(fl!("recently-played"))),
-            false,
         ),
         Tab::Search => match &library.results {
             Load::Idle | Load::Loading => placeholder_text(fl!("searching")),
@@ -753,21 +756,20 @@ fn list_body(state: &Window) -> Element<'_, Message> {
                 for group in groups {
                     column = column.push(section_title(group_title(group.kind)));
                     for entry in &group.entries {
-                        column = column.push(entry_row(state, entry, None));
+                        column = column.push(entry_row(state, entry));
                     }
                 }
                 column.into()
             }
         },
-        Tab::Queue => entries_or(state, &library.queue, fl!("empty-queue"), None, true),
         Tab::Playlists => entries_or(
             state,
             &library.playlists,
             fl!("empty-playlists"),
             Some(liked_row(library.liked_count)),
-            false,
         ),
-        Tab::Podcasts => entries_or(state, &library.shows, fl!("empty-podcasts"), None, false),
+        Tab::Podcasts => entries_or(state, &library.shows, fl!("empty-podcasts"), None),
+        Tab::Books => entries_or(state, &library.books, fl!("empty-books"), None),
     }
 }
 
@@ -776,7 +778,6 @@ fn entries_or<'a>(
     load: &'a Load<Vec<Entry>>,
     empty: String,
     header: Option<Element<'a, Message>>,
-    removable: bool,
 ) -> Element<'a, Message> {
     match load {
         Load::Idle | Load::Loading => placeholder_text(fl!("status-loading")),
@@ -789,9 +790,8 @@ fn entries_or<'a>(
             if list.is_empty() {
                 return column.push(placeholder_text(empty)).into();
             }
-            for (index, entry) in list.iter().enumerate() {
-                let remove_at = removable.then_some(index);
-                column = column.push(entry_row(state, entry, remove_at));
+            for entry in list {
+                column = column.push(entry_row(state, entry));
             }
             column.into()
         }
@@ -863,7 +863,6 @@ fn round_card(theme: &cosmic::Theme, radius: f32) -> cosmic::iced::widget::conta
 fn entry_row<'a>(
     state: &'a Window,
     entry: &'a Entry,
-    remove_at: Option<usize>,
 ) -> Element<'a, Message> {
     let round = entry.kind == EntryKind::Artist;
     let thumb: Element<'a, Message> = match entry
@@ -917,12 +916,7 @@ fn entry_row<'a>(
         );
 
     // The action sits beside the row. Inside it, the click never arrived.
-    let action = if let Some(index) = remove_at {
-        button::icon(icon::from_name("list-remove-symbolic"))
-            .extra_small()
-            .tooltip(fl!("queue-remove"))
-            .on_press(Message::Browse(Browse::Dequeue(index)))
-    } else if entry.kind.is_item() {
+    let action = if entry.kind.is_item() {
         let queued = state.library.queued.contains(&entry.uri);
         button::icon(icon::from_name(if queued {
             "emblem-ok-symbolic"

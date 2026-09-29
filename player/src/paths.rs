@@ -41,3 +41,9 @@ pub fn pid_file() -> PathBuf {
 pub fn scope_socket() -> PathBuf {
     runtime_dir().join("scope.sock")
 }
+
+/// `<state> <unix seconds>`, rewritten every few seconds while the receiver
+/// is alive so the applet can tell a live one from a stuck one.
+pub fn health_file() -> PathBuf {
+    runtime_dir().join("player.health")
+}

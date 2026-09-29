@@ -24,6 +24,8 @@ devices = Devices
 devices-searching = Looking for devices…
 devices-local-starting = The player on this computer is starting up; try again in a few seconds.
 devices-none = No devices. Turn on playback on this computer or open Spotify somewhere else.
+receiver-reconnecting = This computer is reconnecting to Spotify…
+offline = No internet connection. Waiting to reconnect…
 hero-last = Last played: { $track }
 hero-pick-below = Pick something below to play it here.
 hero-start-elsewhere = Start Spotify on any device to see it here.
@@ -61,9 +63,9 @@ player-auth-incomplete = Authorization did not finish.
 ## Library
 
 tab-search = Search
-tab-queue = Queue
 tab-playlists = Playlists
 tab-podcasts = Podcasts
+tab-books = Books
 search-placeholder = Search Spotify
 searching = Searching…
 no-results = No results.
@@ -75,9 +77,9 @@ liked-detail = { $count ->
 }
 empty-list = This list is empty.
 empty-recent = You have not played anything yet. Search for something to start.
-empty-queue = The queue is empty. Add a song with +.
 empty-playlists = You have no playlists yet.
 empty-podcasts = You do not follow any podcasts. Find one and follow it on Spotify.
+empty-books = You have no saved audiobooks. Save one on Spotify to see it here.
 playlist-forbidden = Because of Spotify API limits and restrictions, I cannot show you these songs. Don’t worry: you can still play them and see them in the Queue tab.
 group-tracks = Songs
 group-artists = Artists
@@ -93,9 +95,7 @@ kind-podcast = Podcast
 kind-audiobook = Audiobook
 queue-add = Add to queue
 queue-added = In the queue
-queue-remove = Remove from queue
 queue-queued = Queued: { $track }
-queue-removed = Removed “{ $track }” from the queue
 
 ## Setup
 

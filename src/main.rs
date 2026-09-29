@@ -4,6 +4,7 @@ mod browser;
 mod config;
 mod feed;
 mod i18n;
+mod instance;
 mod look;
 mod marquee;
 mod player;

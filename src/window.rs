@@ -22,6 +22,7 @@ use crate::art::{self, Artwork};
 use crate::browse::{Browse, Library};
 use crate::config::{self, AppConfig, PanelLook};
 use crate::fl;
+use crate::instance::Slot;
 use crate::spotify::{self, Item, PlayerState, Repeat, Session, Spotify, Store, User};
 use crate::{browser, player, ui};
 
@@ -39,6 +40,16 @@ const VOLUME_HOLD: Duration = Duration::from_secs(3);
 const CONTROL_HOLD: Duration = Duration::from_secs(3);
 /// Touchpads report pixels; this many make one wheel notch.
 const PIXELS_PER_NOTCH: f32 = 40.0;
+/// A receiver that keeps failing to start must not be relaunched on every poll.
+const RECEIVER_RESTART_GAP: Duration = Duration::from_secs(30);
+const SLOT_CHECK: Duration = Duration::from_secs(10);
+/// How often a healthy-looking receiver is looked up in Spotify's device list.
+const DEVICE_CHECK: Duration = Duration::from_secs(60);
+/// Misses in a row before a receiver that still reports itself connected is
+/// restarted. Spotify's list lags a little, so one miss is not proof.
+const DEVICE_MISSES: u8 = 2;
+/// A paused track this close to its end has nothing left to resume.
+const ENDED_SLACK_MS: u64 = 1_500;
 
 /// Marks the activation-token request for the receiver's authorization; URLs
 /// always carry a scheme, so it cannot be mistaken for one.
@@ -75,6 +86,8 @@ pub struct Window {
     pub(crate) player: Option<PlayerState>,
     fetched_at: Instant,
     pub(crate) loaded: bool,
+    /// The last poll could not reach Spotify at all.
+    pub(crate) offline: bool,
     /// The last thing that played, shown dimmed while nothing plays.
     pub(crate) last_item: Option<Item>,
     pub(crate) error: Option<String>,
@@ -88,7 +101,7 @@ pub struct Window {
     volume_held: Option<(u8, Instant)>,
     /// Controls kept as the user left them until a poll agrees.
     playback_held: Option<PlaybackHold>,
-    /// Progress kept on screen while a queue edit restarts playback underneath.
+    /// Progress kept on screen while a seek reaches Spotify.
     progress_held: Option<(u64, Instant, bool)>,
     volume_before_mute: Option<u8>,
     scroll_notches: f32,
@@ -98,6 +111,11 @@ pub struct Window {
     pub(crate) playback: Playback,
     playback_login: Option<Handle>,
     pub(crate) device_name: String,
+    pub(crate) receiver: player::Receiver,
+    receiver_started: Option<Instant>,
+    device_checked: Option<Instant>,
+    device_misses: u8,
+    slot: Option<Slot>,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +142,7 @@ pub enum Message {
     RealignPopup,
     Poll,
     Tick,
+    CheckSlot,
     PlayerLoaded(Box<Result<Option<PlayerState>, spotify::Error>>),
     SavedLoaded(String, Result<bool, spotify::Error>),
     ArtLoaded(String, Result<Artwork, String>),
@@ -140,11 +159,32 @@ pub enum Message {
     ToggleMute,
     Scroll(ScrollDelta),
     CommandDone(Result<(), spotify::Error>),
+    /// Spotify's device list, and whether a command had just found no device.
+    DevicesChecked(bool, Result<Vec<spotify::Device>, spotify::Error>),
     Browse(Browse),
     EnablePlayback,
     CancelPlayback,
     PlaybackLoginFinished(Result<(), String>),
     DisablePlayback,
+}
+
+impl Message {
+    /// Player commands, which would only fail silently without a connection.
+    fn needs_network(&self) -> bool {
+        match self {
+            Self::PlayPause
+            | Self::Next
+            | Self::Previous
+            | Self::ToggleShuffle
+            | Self::CycleRepeat
+            | Self::ToggleSaved
+            | Self::SeekRelease
+            | Self::VolumeCommit(_)
+            | Self::ToggleMute => true,
+            Self::Browse(browse) => browse.needs_network(),
+            _ => false,
+        }
+    }
 }
 
 /// What the user just did, kept on screen while an older poll is still in flight.
@@ -254,6 +294,7 @@ impl cosmic::Application for Window {
             player: None,
             fetched_at: Instant::now(),
             loaded: false,
+            offline: false,
             last_item: load_last_item(),
             error,
             saved: None,
@@ -273,6 +314,11 @@ impl cosmic::Application for Window {
             playback: Playback::Missing,
             playback_login: None,
             device_name: player::device_name(),
+            receiver: player::Receiver::Stopped,
+            receiver_started: None,
+            device_checked: None,
+            device_misses: 0,
+            slot: Slot::claim(),
         };
         window.sync_playback();
         let task = window.refresh_player();
@@ -285,6 +331,10 @@ impl cosmic::Application for Window {
 
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, message: Message) -> Task<Action<Self::Message>> {
+        if self.offline && message.needs_network() {
+            self.seek_drag = None;
+            return self.notify(fl!("offline"));
+        }
         match message {
             Message::TogglePopup => {
                 if self.popup.is_some() {
@@ -415,7 +465,16 @@ impl cosmic::Application for Window {
                 return delayed(Duration::from_millis(80), Message::RealignPopup);
             }
             Message::RealignPopup => return self.realign_popup(),
-            Message::Poll => return self.refresh_player(),
+            Message::Poll => {
+                self.ensure_receiver();
+                return Task::batch([self.refresh_player(), self.check_devices(false)]);
+            }
+            Message::CheckSlot => {
+                if self.slot.as_ref().is_some_and(Slot::taken_over) {
+                    eprintln!("a newer instance took over this panel slot; exiting");
+                    std::process::exit(0);
+                }
+            }
             Message::Tick => {
                 // A track that ran out locally has changed on Spotify's side too.
                 if let Some(item) = self.item()
@@ -427,13 +486,30 @@ impl cosmic::Application for Window {
                 }
             }
             Message::PlayerLoaded(result) => match *result {
-                Ok(player) => return self.apply_player(player),
+                Ok(player) => {
+                    let back_online = std::mem::take(&mut self.offline);
+                    let applied = self.apply_player(player);
+                    if !back_online {
+                        return applied;
+                    }
+                    eprintln!("Spotify is reachable again");
+                    self.ensure_receiver();
+                    self.library.retry_failed();
+                    return Task::batch([applied, self.ensure_library()]);
+                }
+                Err(error @ spotify::Error::Network(_)) => {
+                    if !self.offline {
+                        eprintln!("player poll failed, treating as offline: {error}");
+                    }
+                    self.offline = true;
+                    self.playback_held = None;
+                }
                 // A poll that hiccups keeps what is on screen; the next one retries.
-                Err(
-                    error @ (spotify::Error::Network(_)
-                    | spotify::Error::Server(_)
-                    | spotify::Error::RateLimited { .. }),
-                ) if self.loaded => eprintln!("player poll failed: {error}"),
+                Err(error @ (spotify::Error::Server(_) | spotify::Error::RateLimited { .. }))
+                    if self.loaded =>
+                {
+                    eprintln!("player poll failed: {error}");
+                }
                 Err(error) => self.handle_api_error(&error),
             },
             Message::SavedLoaded(uri, result) => {
@@ -463,7 +539,7 @@ impl cosmic::Application for Window {
                 return if playing {
                     self.command(|spotify| async move { spotify.pause().await })
                 } else {
-                    self.command(|spotify| async move { spotify.play().await })
+                    self.resume()
                 };
             }
             Message::Next => {
@@ -560,10 +636,25 @@ impl cosmic::Application for Window {
                         spotify::Error::Reauth | spotify::Error::SignedOut => {
                             self.handle_api_error(error);
                         }
+                        spotify::Error::NoDevice => {
+                            eprintln!("player command failed: {error}");
+                            self.ensure_receiver();
+                            return Task::batch([self.refresh_player(), self.check_devices(true)]);
+                        }
+                        spotify::Error::Network(_) => {
+                            eprintln!("player command failed: {error}");
+                            self.offline = true;
+                            return self.notify(fl!("offline"));
+                        }
                         other => eprintln!("player command failed: {other}"),
                     }
                 }
                 return self.refresh_player();
+            }
+            Message::DevicesChecked(after_failure, result) => {
+                if let Ok(devices) = result {
+                    self.note_devices(after_failure, &devices);
+                }
             }
             Message::Browse(message) => return self.update_browse(message),
             Message::EnablePlayback => return self.enable_playback(),
@@ -603,6 +694,9 @@ impl cosmic::Application for Window {
             activation_token_subscription(0).map(Message::Token),
             cosmic::iced::window::resize_events().map(|(id, size)| Message::PanelResized(id, size)),
         ];
+        if self.slot.is_some() {
+            subscriptions.push(time::every(SLOT_CHECK).map(|_| Message::CheckSlot));
+        }
         if matches!(self.session, Session::Connected(_)) {
             subscriptions.push(time::every(self.poll_interval()).map(|_| Message::Poll));
             if self.popup.is_some() && self.is_playing() {
@@ -716,7 +810,7 @@ impl Window {
         hold
     }
 
-    fn hold_skipped_track(&mut self) {
+    pub(crate) fn hold_skipped_track(&mut self) {
         let Some(uri) = self.item().map(|item| item.uri.clone()) else {
             return;
         };
@@ -754,8 +848,18 @@ impl Window {
         self.progress_held = Some((progress, Instant::now(), self.is_playing()));
     }
 
+    pub(crate) fn receiver_reconnecting(&self) -> bool {
+        self.playback == Playback::Ready
+            && matches!(
+                self.receiver,
+                player::Receiver::Connecting | player::Receiver::Stuck
+            )
+    }
+
     fn poll_interval(&self) -> Duration {
-        Duration::from_secs(if self.popup.is_some() {
+        Duration::from_secs(if self.offline {
+            5
+        } else if self.popup.is_some() {
             4
         } else if self.is_playing() {
             15
@@ -864,18 +968,108 @@ impl Window {
         self.ensure_receiver();
     }
 
-    /// Restarts the receiver if it is not running, e.g. after a reboot or
-    /// when its session kept dropping.
+    /// Starts the receiver if it is not running, e.g. after a reboot, and
+    /// replaces one that is alive but stopped writing its heartbeat.
     fn ensure_receiver(&mut self) {
-        if self.playback != Playback::Ready
-            || !matches!(self.session, Session::Connected(_))
-            || player::running()
+        if self.playback != Playback::Ready || !matches!(self.session, Session::Connected(_)) {
+            self.receiver = player::Receiver::Stopped;
+            return;
+        }
+        self.receiver = player::status();
+        if !matches!(
+            self.receiver,
+            player::Receiver::Stopped | player::Receiver::Stuck
+        ) || self
+            .receiver_started
+            .is_some_and(|at| at.elapsed() < RECEIVER_RESTART_GAP)
         {
             return;
         }
-        if let Err(error) = player::start() {
+        self.receiver_started = Some(Instant::now());
+        if self.receiver == player::Receiver::Stuck {
+            eprintln!("receiver stopped answering; restarting it");
+            player::restart();
+        } else if let Err(error) = player::start() {
             self.error = Some(error);
+            return;
         }
+        self.receiver = player::Receiver::Connecting;
+    }
+
+    /// Looks for this computer in Spotify's device list. The receiver can lose
+    /// Spotify's push connection while its session, and so its heartbeat, stays
+    /// fine; then it vanishes from the list and every command finds no device.
+    fn check_devices(&mut self, after_failure: bool) -> Task<Action<Message>> {
+        let settling = self
+            .receiver_started
+            .is_some_and(|at| at.elapsed() < RECEIVER_RESTART_GAP);
+        let recent = self
+            .device_checked
+            .is_some_and(|at| at.elapsed() < DEVICE_CHECK);
+        if self.receiver != player::Receiver::Connected || settling || (recent && !after_failure) {
+            return Task::none();
+        }
+        let Some(spotify) = self.client() else {
+            return Task::none();
+        };
+        self.device_checked = Some(Instant::now());
+        Task::perform(async move { spotify.devices().await }, move |result| {
+            Action::App(Message::DevicesChecked(after_failure, result))
+        })
+    }
+
+    fn note_devices(&mut self, after_failure: bool, devices: &[spotify::Device]) {
+        if devices.iter().any(|device| device.name == self.device_name) {
+            self.device_misses = 0;
+            return;
+        }
+        self.device_misses = self.device_misses.saturating_add(1);
+        let settling = self
+            .receiver_started
+            .is_some_and(|at| at.elapsed() < RECEIVER_RESTART_GAP);
+        if self.receiver != player::Receiver::Connected
+            || settling
+            || (self.device_misses < DEVICE_MISSES && !after_failure)
+        {
+            return;
+        }
+        eprintln!("receiver is connected but missing from Spotify's devices; restarting it");
+        self.device_misses = 0;
+        self.receiver_started = Some(Instant::now());
+        player::restart();
+        self.receiver = player::Receiver::Connecting;
+    }
+
+    /// Play when nothing is playing. Once an album or the queue has run out
+    /// Spotify has nothing to resume, so the last track starts again instead.
+    fn resume(&self) -> Task<Action<Message>> {
+        let ended = match (&self.player, self.item()) {
+            (Some(_), None) => self.last_item.clone(),
+            (_, Some(item))
+                if item.duration_ms > 0
+                    && self.progress_ms() + ENDED_SLACK_MS >= item.duration_ms =>
+            {
+                Some(item.clone())
+            }
+            _ => None,
+        };
+        let fallback = self.shown_item().cloned();
+        self.command(move |spotify| async move {
+            if let Some(item) = ended {
+                return spotify
+                    .play_item(&item.uri, item.parent_uri.as_deref())
+                    .await;
+            }
+            let result = spotify.play().await;
+            match (&result, fallback) {
+                (Err(spotify::Error::NotFound(_) | spotify::Error::Forbidden(_)), Some(item)) => {
+                    spotify
+                        .play_item(&item.uri, item.parent_uri.as_deref())
+                        .await
+                }
+                _ => result,
+            }
+        })
     }
 
     fn enable_playback(&mut self) -> Task<Action<Message>> {
@@ -991,8 +1185,8 @@ impl Window {
                 self.progress_held = None;
             }
         }
-        // Rebuilding the queue makes Spotify answer "nothing playing" for a
-        // moment. Dropping the track here shrinks the panel back to the icon.
+        // Spotify can answer "nothing playing" for a moment right after a seek.
+        // Dropping the track here shrinks the panel back to the icon.
         if self.progress_held.is_some()
             && player.as_ref().is_none_or(|player| player.item.is_none())
         {
@@ -1018,7 +1212,6 @@ impl Window {
         {
             self.library.remember_item(&item);
             tasks.push(self.note_recent_stale());
-            tasks.push(self.note_queue_stale());
         }
         if let Some(uri) = self.item().map(|item| item.uri.clone())
             && uri != self.saved_uri
@@ -1047,20 +1240,6 @@ impl Window {
         if showing {
             self.ensure_library()
         } else {
-            Task::none()
-        }
-    }
-
-    /// A new track means a new "up next", whether it came from a playlist, the
-    /// queue itself, or another device.
-    fn note_queue_stale(&mut self) -> Task<Action<Message>> {
-        let showing = self.popup.is_some()
-            && self.library.detail.is_none()
-            && self.library.tab == crate::browse::Tab::Queue;
-        if showing {
-            self.refresh_queue()
-        } else {
-            self.library.queue = crate::browse::Load::Idle;
             Task::none()
         }
     }

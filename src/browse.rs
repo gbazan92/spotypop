@@ -1,4 +1,4 @@
-//! The library half of the popup: search, queue, playlists and podcasts,
+//! The library half of the popup: search, playlists, podcasts, audiobooks,
 //! the contents of whatever is opened, and the device picker.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -31,9 +31,9 @@ const VISIBLE_ROWS: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     Search,
-    Queue,
     Playlists,
     Podcasts,
+    Books,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -88,13 +88,10 @@ pub struct Library {
     recent_generation: u64,
     /// The track changed, so play history may have a new row.
     recent_dirty: bool,
-    pub queue: Load<Vec<Entry>>,
-    queue_generation: u64,
-    /// Tracks just removed, so a stale reload cannot put them back.
-    dropped: Vec<(String, std::time::Instant)>,
     pub playlists: Load<Vec<Entry>>,
     pub liked_count: u64,
     pub shows: Load<Vec<Entry>>,
+    pub books: Load<Vec<Entry>>,
     pub detail: Option<Detail>,
     pub devices: Option<Load<Vec<Device>>>,
     pub thumbs: HashMap<String, Option<Handle>>,
@@ -115,9 +112,9 @@ impl Default for Library {
     fn default() -> Self {
         let tabs = SingleSelectModel::builder()
             .insert(|tab| tab.text(fl!("tab-search")).data(Tab::Search).activate())
-            .insert(|tab| tab.text(fl!("tab-queue")).data(Tab::Queue))
             .insert(|tab| tab.text(fl!("tab-playlists")).data(Tab::Playlists))
             .insert(|tab| tab.text(fl!("tab-podcasts")).data(Tab::Podcasts))
+            .insert(|tab| tab.text(fl!("tab-books")).data(Tab::Books))
             .build();
         Self {
             tabs,
@@ -130,12 +127,10 @@ impl Default for Library {
             recent_at: None,
             recent_generation: 0,
             recent_dirty: false,
-            queue: Load::Idle,
-            queue_generation: 0,
-            dropped: Vec::new(),
             playlists: Load::Idle,
             liked_count: 0,
             shows: Load::Idle,
+            books: Load::Idle,
             detail: None,
             devices: None,
             thumbs: HashMap::new(),
@@ -162,6 +157,20 @@ impl Library {
 
     fn saved_scroll(&self) -> f32 {
         self.scroll.get(&self.scroll_key()).copied().unwrap_or(0.0)
+    }
+
+    /// Lists that failed, e.g. while offline, load again next time they show.
+    pub(crate) fn retry_failed(&mut self) {
+        for load in [
+            &mut self.recent,
+            &mut self.playlists,
+            &mut self.shows,
+            &mut self.books,
+        ] {
+            if matches!(load, Load::Failed(_)) {
+                *load = Load::Idle;
+            }
+        }
     }
 
     pub(crate) fn mark_recent_dirty(&mut self) {
@@ -202,36 +211,6 @@ impl Library {
                 .recent_at
                 .is_none_or(|at| at.elapsed() > RECENT_REFRESH)
     }
-
-    /// Drops one copy of each track the user just removed, if Spotify still lists it.
-    fn without_dropped(&mut self, mut entries: Vec<Entry>) -> Vec<Entry> {
-        let now = std::time::Instant::now();
-        self.dropped.retain(|(_, until)| *until > now);
-        for (uri, _) in &self.dropped {
-            if let Some(index) = entries.iter().position(|entry| entry.uri == *uri) {
-                entries.remove(index);
-            }
-        }
-        entries
-    }
-}
-
-/// What should follow `uri`. Picked from the queue itself, the rows before it
-/// were skipped; picked elsewhere, the whole queue still follows.
-fn queue_after(upcoming: &[Entry], uri: &str, from_queue: bool) -> Vec<String> {
-    let start = if from_queue {
-        upcoming
-            .iter()
-            .position(|entry| entry.uri == uri)
-            .map_or(0, |at| at + 1)
-    } else {
-        0
-    };
-    upcoming[start..]
-        .iter()
-        .filter(|entry| entry.uri != uri)
-        .map(|entry| entry.uri.clone())
-        .collect()
 }
 
 /// Heard tracks first, then Spotify's history, each URI once.
@@ -253,7 +232,7 @@ impl Tab {
     fn name(self) -> &'static str {
         match self {
             Self::Search => "search",
-            Self::Queue => "queue",
+            Self::Books => "books",
             Self::Playlists => "playlists",
             Self::Podcasts => "podcasts",
         }
@@ -270,8 +249,8 @@ pub enum Browse {
     SearchLoaded(u64, Result<Vec<SearchGroup>, spotify::Error>),
     RecentLoaded(u64, Result<Vec<Entry>, spotify::Error>),
     PlaylistsLoaded(Result<(Vec<Entry>, u64), spotify::Error>),
-    QueueLoaded(u64, Result<Vec<Entry>, spotify::Error>),
     ShowsLoaded(Result<Vec<Entry>, spotify::Error>),
+    BooksLoaded(Result<Vec<Entry>, spotify::Error>),
     /// A row was clicked: open a context, or play an item.
     Activate(Entry),
     /// Play a whole context without opening it.
@@ -282,14 +261,26 @@ pub enum Browse {
     PlayDetail,
     Queue(Entry),
     Queued(String, String, Result<(), spotify::Error>),
-    Dequeue(usize),
-    Dequeued(String, Result<(), spotify::Error>),
     ThumbLoaded(String, Option<Handle>),
     Reload,
     ToggleDevices,
     DevicesLoaded(Result<Vec<Device>, spotify::Error>),
     Transfer(String),
     ClearNotice(u64),
+}
+
+impl Browse {
+    /// Rows and buttons that start playback or change the queue.
+    pub(crate) fn needs_network(&self) -> bool {
+        matches!(
+            self,
+            Self::Activate(_)
+                | Self::PlayContext(_)
+                | Self::PlayDetail
+                | Self::Queue(_)
+                | Self::Transfer(_)
+        )
+    }
 }
 
 fn detail_request(
@@ -403,24 +394,14 @@ impl Window {
                 };
                 return self.enqueue_thumbs();
             }
-            Browse::QueueLoaded(generation, result) => {
-                if generation != self.library.queue_generation {
-                    return Task::none();
-                }
-                self.note_error(&result);
-                let queue = match result {
-                    Err(spotify::Error::NoDevice | spotify::Error::NotFound(_)) => {
-                        Load::Ready(Vec::new())
-                    }
-                    Ok(entries) => Load::Ready(self.library.without_dropped(entries)),
-                    Err(error) => Load::Failed(error.to_string()),
-                };
-                self.library.queue = queue;
-                return self.enqueue_thumbs();
-            }
             Browse::ShowsLoaded(result) => {
                 self.note_error(&result);
                 self.library.shows = Load::from_result(result);
+                return self.enqueue_thumbs();
+            }
+            Browse::BooksLoaded(result) => {
+                self.note_error(&result);
+                self.library.books = Load::from_result(result);
                 return self.enqueue_thumbs();
             }
             Browse::Activate(entry) => return self.activate(entry),
@@ -450,34 +431,11 @@ impl Window {
                     |(name, uri, result)| browse(Browse::Queued(name, uri, result)),
                 );
             }
-            Browse::Dequeue(index) => return self.remove_from_queue(index),
-            Browse::Dequeued(name, result) => {
-                return match result {
-                    Ok(()) => self.notify(fl!("queue-removed", track = name)),
-                    Err(error) => {
-                        self.library.queue = Load::Idle;
-                        self.handle_api_error(&error);
-                        if self.library.tab == Tab::Queue {
-                            self.ensure_library()
-                        } else {
-                            Task::none()
-                        }
-                    }
-                };
-            }
             Browse::Queued(name, uri, result) => {
                 return match result {
                     Ok(()) => {
-                        self.library.dropped.retain(|(dropped, _)| dropped != &uri);
                         self.library.queued.insert(uri);
-                        self.library.queue = Load::Idle;
-                        let notice = self.notify(fl!("queue-queued", track = name));
-                        let refresh = if self.library.tab == Tab::Queue {
-                            self.ensure_library()
-                        } else {
-                            Task::none()
-                        };
-                        Task::batch([notice, refresh])
+                        self.notify(fl!("queue-queued", track = name))
                     }
                     Err(error) => {
                         self.library.notice = None;
@@ -501,9 +459,9 @@ impl Window {
                         self.library.search_generation += 1;
                         return Task::batch([self.run_search(), self.refresh_player()]);
                     }
-                    Tab::Queue => self.library.queue = Load::Idle,
                     Tab::Playlists => self.library.playlists = Load::Idle,
                     Tab::Podcasts => self.library.shows = Load::Idle,
+                    Tab::Books => self.library.books = Load::Idle,
                 }
                 if let Some(detail) = self.library.detail.as_mut() {
                     detail.items = Load::Idle;
@@ -580,11 +538,6 @@ impl Window {
                 }
             }
             Tab::Search => {}
-            Tab::Queue => {
-                if matches!(library.queue, Load::Idle) {
-                    return self.refresh_queue();
-                }
-            }
             Tab::Playlists => {
                 if matches!(library.playlists, Load::Idle) {
                     library.playlists = Load::Loading;
@@ -605,26 +558,18 @@ impl Window {
                     );
                 }
             }
+            Tab::Books => {
+                if matches!(library.books, Load::Idle) {
+                    library.books = Load::Loading;
+                    return fetch(
+                        spotify,
+                        |spotify| async move { spotify.audiobooks().await },
+                        Browse::BooksLoaded,
+                    );
+                }
+            }
         }
         Task::none()
-    }
-
-    /// Fetches the queue again, keeping a list already on screen until the new
-    /// one arrives.
-    pub(crate) fn refresh_queue(&mut self) -> Task<Action<Message>> {
-        let Some(spotify) = self.client() else {
-            return Task::none();
-        };
-        let library = &mut self.library;
-        if !matches!(library.queue, Load::Ready(_)) {
-            library.queue = Load::Loading;
-        }
-        library.queue_generation = library.queue_generation.wrapping_add(1);
-        let generation = library.queue_generation;
-        Task::perform(
-            async move { spotify.playback_queue().await },
-            move |result| browse(Browse::QueueLoaded(generation, result)),
-        )
     }
 
     fn run_search(&mut self) -> Task<Action<Message>> {
@@ -671,31 +616,9 @@ impl Window {
         if entry.kind == EntryKind::Artist {
             return self.update_browse(Browse::PlayContext(entry));
         }
-        self.play_before_queue(entry)
+        let (uri, parent) = (entry.uri, entry.parent_uri);
+        self.command(move |spotify| async move { spotify.play_item(&uri, parent.as_deref()).await })
     }
-
-    /// Plays a single track and then whatever the queue already had, so the
-    /// next button does not drop into that track's album or stop.
-    fn play_before_queue(&mut self, entry: Entry) -> Task<Action<Message>> {
-        let from_queue = self.library.tab == Tab::Queue;
-        let uri = entry.uri;
-        let parent = entry.parent_uri;
-        self.library.queue = Load::Idle;
-        self.command(move |spotify| async move {
-            let upcoming = spotify.playback_queue().await.unwrap_or_default();
-            let after = queue_after(&upcoming, &uri, from_queue);
-            if after.is_empty()
-                && let Some(context) = parent
-            {
-                return spotify.play_context(&context, Some(&uri)).await;
-            }
-            let mut uris = Vec::with_capacity(after.len() + 1);
-            uris.push(uri);
-            uris.extend(after);
-            spotify.play_uris(&uris).await
-        })
-    }
-
     fn open(&mut self, source: Source) -> Task<Action<Message>> {
         let Some(spotify) = self.client() else {
             return Task::none();
@@ -777,57 +700,6 @@ impl Window {
             }
         };
         Some((first, follow))
-    }
-
-    /// Spotify has no "remove from queue". Rebuild what will play, without that row.
-    fn remove_from_queue(&mut self, index: usize) -> Task<Action<Message>> {
-        let Load::Ready(items) = &self.library.queue else {
-            return Task::none();
-        };
-        if index >= items.len() {
-            return Task::none();
-        }
-        let name = items[index].name.clone();
-        let removed = items[index].uri.clone();
-        let mut uris = Vec::new();
-        if let Some(current) = self.item().map(|item| item.uri.clone()) {
-            uris.push(current);
-        }
-        uris.extend(
-            items
-                .iter()
-                .enumerate()
-                .filter(|(at, _)| *at != index)
-                .map(|(_, entry)| entry.uri.clone()),
-        );
-        let was_playing = self.is_playing();
-        let position = self.progress_ms();
-        self.hold_progress();
-        // Drop any queue snapshot that left before this removal.
-        self.library.queue_generation = self.library.queue_generation.wrapping_add(1);
-        self.library
-            .dropped
-            .push((removed, std::time::Instant::now() + Duration::from_secs(20)));
-        if let Load::Ready(list) = &mut self.library.queue {
-            list.remove(index);
-        }
-        let Some(spotify) = self.client() else {
-            return Task::none();
-        };
-        Task::perform(
-            async move {
-                if !uris.is_empty() {
-                    // One request, already at the current position, so the bar
-                    // does not jump to the start and then seek forward.
-                    spotify.play_uris_at(&uris, position).await?;
-                    if !was_playing {
-                        let _ = spotify.pause().await;
-                    }
-                }
-                Ok(())
-            },
-            move |result| browse(Browse::Dequeued(name, result)),
-        )
     }
 
     fn play_detail(&mut self) -> Task<Action<Message>> {
@@ -923,9 +795,9 @@ impl Window {
                 Load::Ready(groups) => groups.iter().flat_map(|group| &group.entries).collect(),
                 _ => Vec::new(),
             },
-            Tab::Queue => ready(&library.queue),
             Tab::Playlists => ready(&library.playlists),
             Tab::Podcasts => ready(&library.shows),
+            Tab::Books => ready(&library.books),
         }
     }
 
@@ -1041,15 +913,6 @@ mod tests {
         assert_eq!(merged[1].uri, "spotify:track:old");
     }
 
-    #[test]
-    fn a_picked_track_is_followed_by_the_queue() {
-        let queue = [entry("a"), entry("b"), entry("c")];
-        assert_eq!(queue_after(&queue, "x", false), ["a", "b", "c"]);
-        assert_eq!(queue_after(&queue, "b", false), ["a", "c"]);
-        assert_eq!(queue_after(&queue, "b", true), ["c"]);
-        assert!(queue_after(&[], "x", false).is_empty());
-    }
-
     fn played(uri: &str, name: &str) -> crate::spotify::Item {
         crate::spotify::Item {
             kind: crate::spotify::ItemKind::Track,
@@ -1078,24 +941,6 @@ mod tests {
         assert!(library.saved_scroll().abs() < f32::EPSILON);
         library.detail = None;
         assert!((library.saved_scroll() - 240.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn a_removed_track_stays_out_of_a_stale_queue() {
-        let mut library = Library::default();
-        library.dropped.push((
-            "spotify:track:removed".into(),
-            std::time::Instant::now() + std::time::Duration::from_secs(20),
-        ));
-        let stale = vec![
-            entry("spotify:track:other"),
-            entry("spotify:track:removed"),
-            entry("spotify:track:removed"),
-        ];
-        let kept = library.without_dropped(stale);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].uri, "spotify:track:other");
-        assert_eq!(kept[1].uri, "spotify:track:removed");
     }
 
     fn entry(uri: &str) -> Entry {

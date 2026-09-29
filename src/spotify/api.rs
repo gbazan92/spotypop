@@ -21,8 +21,7 @@ const LIST_LIMIT: usize = 200;
 const PAGE_SIZE: usize = 50;
 const MAX_PLAY_URIS: usize = 100;
 const LOCAL_DEVICE_POLLS: u32 = 8;
-const LOCAL_DEVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-/// Refresh a little early so a request never leaves with a token about to expire.
+const LOCAL_DEVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);/// Refresh a little early so a request never leaves with a token about to expire.
 const EXPIRY_MARGIN_SECS: u64 = 45;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,11 +350,6 @@ impl Spotify {
     }
 
     pub async fn play_uris(&self, uris: &[String]) -> Result<(), Error> {
-        self.play_uris_at(uris, 0).await
-    }
-
-    /// Same as [`play_uris`], starting the first track at `position_ms`.
-    pub async fn play_uris_at(&self, uris: &[String], position_ms: u64) -> Result<(), Error> {
         let uris = uris
             .iter()
             .take(MAX_PLAY_URIS)
@@ -364,24 +358,18 @@ impl Spotify {
         if uris.is_empty() {
             return Ok(());
         }
-        let mut body = json!({ "uris": uris });
-        if position_ms > 0 {
-            body["position_ms"] = json!(position_ms);
-        }
+        let body = json!({ "uris": uris });
         self.with_device(Method::PUT, "/me/player/play", &[], Some(&body))
             .await
     }
 
-    /// What will play after the current track. An idle player has no queue.
-    pub async fn playback_queue(&self) -> Result<Vec<Entry>, Error> {
-        let payload: Option<Value> = self.get("/me/player/queue", &[]).await?;
-        Ok(payload
-            .and_then(|payload| payload.get("queue").cloned())
-            .map(|queue| {
-                let page = json!({ "items": queue });
-                library::entries(&page, None, None)
-            })
-            .unwrap_or_default())
+    /// Plays one item inside its album or show, so play carries on after it
+    /// and whatever the user queued still comes next.
+    pub async fn play_item(&self, uri: &str, parent: Option<&str>) -> Result<(), Error> {
+        match parent {
+            Some(parent) => self.play_context(parent, Some(uri)).await,
+            None => self.play_uris(&[uri.to_owned()]).await,
+        }
     }
 
     pub async fn queue(&self, uri: &str) -> Result<(), Error> {
@@ -494,6 +482,11 @@ impl Spotify {
 
     pub async fn shows(&self) -> Result<Vec<Entry>, Error> {
         self.collection("/me/shows", &[], Some("show"), LIBRARY_LIMIT)
+            .await
+    }
+
+    pub async fn audiobooks(&self) -> Result<Vec<Entry>, Error> {
+        self.collection("/me/audiobooks", &[], Some("audiobook"), LIBRARY_LIMIT)
             .await
     }
 

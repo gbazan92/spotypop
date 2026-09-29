@@ -128,7 +128,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Marquee<'_, Message> {
         let cycle = PAUSE + lap / SPEED;
         let elapsed = now.saturating_duration_since(started).as_secs_f32() % cycle;
         state.offset = (elapsed - PAUSE).max(0.0) * SPEED;
-        shell.request_redraw_at(*now + FRAME);
+        // Nothing moves during the rest, so sleep through it.
+        let next = if elapsed < PAUSE {
+            Duration::from_secs_f32(PAUSE - elapsed).max(FRAME)
+        } else {
+            FRAME
+        };
+        shell.request_redraw_at(*now + next);
     }
 
     fn draw(

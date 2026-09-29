@@ -4,7 +4,7 @@ A Spotify mini player for the panel of the [COSMIC™](https://system76.com/cosm
 
 - Shows the current song in the panel, with its cover or a live audio scope.
 - Play, pause, skip, seek, shuffle, repeat, volume and like from a popup.
-- Search Spotify, browse your playlists and podcasts, and manage the queue.
+- Search Spotify, browse your playlists, podcasts and audiobooks, and add songs to the queue.
 - Pick which Spotify Connect device plays.
 - Optionally turns this computer into a Spotify Connect device, so music plays
   without the Spotify app open.
@@ -27,7 +27,7 @@ flatpak install --user cosmic io.github.gbazan92.SpotyPop
 > [latest release](https://github.com/gbazan92/spotypop/releases/latest):
 >
 > ```sh
-> flatpak install --user SpotyPop-0.1.0.flatpak
+> flatpak install --user SpotyPop-0.2.0.flatpak
 > ```
 
 Then add **SpotyPop** to the panel from COSMIC Settings → Desktop → Panel → Applets.
