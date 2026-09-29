@@ -154,9 +154,7 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         .on_press(Message::TogglePopup);
 
     let area = mouse_area(button)
-        .on_right_press(Message::OpenSettings)
-        .on_middle_press(Message::PlayPause)
-        .on_scroll(Message::Scroll);
+        .on_right_press(Message::OpenSettings);
 
     applet.autosize_window(area).into()
 }

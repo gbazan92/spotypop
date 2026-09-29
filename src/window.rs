@@ -11,7 +11,6 @@ use cosmic::cctk::sctk::reexports::protocols::xdg::shell::client::xdg_positioner
     Anchor, Gravity,
 };
 use cosmic::cosmic_config::{self, Config};
-use cosmic::iced::mouse::ScrollDelta;
 use cosmic::iced::task::Handle;
 use cosmic::iced::window::Id;
 use cosmic::iced::{Limits, Subscription, time};
@@ -30,7 +29,6 @@ pub const APP_ID: &str = "io.github.gbazan92.SpotyPop";
 pub const DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
 const STATE_DIR: &str = "spotypop";
 
-const VOLUME_STEP: i16 = 5;
 /// Spotify takes a moment before a command shows up in `/me/player`.
 const SETTLE: Duration = Duration::from_millis(700);
 const VOLUME_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -38,8 +36,6 @@ const VOLUME_DEBOUNCE: Duration = Duration::from_millis(250);
 const VOLUME_HOLD: Duration = Duration::from_secs(3);
 /// Same wait for play, pause, shuffle and the other controls.
 const CONTROL_HOLD: Duration = Duration::from_secs(3);
-/// Touchpads report pixels; this many make one wheel notch.
-const PIXELS_PER_NOTCH: f32 = 40.0;
 /// A receiver that keeps failing to start must not be relaunched on every poll.
 const RECEIVER_RESTART_GAP: Duration = Duration::from_secs(30);
 const SLOT_CHECK: Duration = Duration::from_secs(10);
@@ -50,6 +46,9 @@ const DEVICE_CHECK: Duration = Duration::from_secs(60);
 const DEVICE_MISSES: u8 = 2;
 /// A paused track this close to its end has nothing left to resume.
 const ENDED_SLACK_MS: u64 = 1_500;
+/// Creating and destroying popups faster than this can hand the renderer a
+/// surface whose size changed under it, which panics inside libcosmic.
+const POPUP_TOGGLE_GAP: Duration = Duration::from_millis(300);
 
 /// Marks the activation-token request for the receiver's authorization; URLs
 /// always carry a scheme, so it cannot be mistaken for one.
@@ -59,6 +58,16 @@ const PLAYER_LOGIN: &str = "player-login";
 pub enum View {
     Player,
     Settings,
+}
+
+/// Keeps `/me/player` requests from piling up when polls, commands and the
+/// popup all ask for the state at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayerFetch {
+    Idle,
+    Pending,
+    /// Something changed while the request was out, so ask once more after it.
+    Stale,
 }
 
 /// Whether this computer can play on its own through the local receiver.
@@ -74,6 +83,8 @@ pub enum Playback {
 pub struct Window {
     pub(crate) core: Core,
     popup: Option<Id>,
+    popup_toggled: Option<Instant>,
+    player_fetch: PlayerFetch,
     /// Last size of the panel button, so the popup can be anchored to it.
     panel_size: Option<(u32, u32)>,
     pub(crate) view: View,
@@ -104,7 +115,6 @@ pub struct Window {
     /// Progress kept on screen while a seek reaches Spotify.
     progress_held: Option<(u64, Instant, bool)>,
     volume_before_mute: Option<u8>,
-    scroll_notches: f32,
     pub(crate) copied: bool,
     token_tx: Option<Sender<TokenRequest>>,
     pub(crate) library: Library,
@@ -157,7 +167,6 @@ pub enum Message {
     SetVolume(u8),
     VolumeCommit(u64),
     ToggleMute,
-    Scroll(ScrollDelta),
     CommandDone(Result<(), spotify::Error>),
     /// Spotify's device list, and whether a command had just found no device.
     DevicesChecked(bool, Result<Vec<spotify::Device>, spotify::Error>),
@@ -283,6 +292,8 @@ impl cosmic::Application for Window {
         let mut window = Self {
             core,
             popup: None,
+            popup_toggled: None,
+            player_fetch: PlayerFetch::Idle,
             panel_size: None,
             view: View::Player,
             config_handler,
@@ -307,7 +318,6 @@ impl cosmic::Application for Window {
             playback_held: None,
             progress_held: None,
             volume_before_mute: None,
-            scroll_notches: 0.0,
             copied: false,
             token_tx: None,
             library: Library::default(),
@@ -334,6 +344,16 @@ impl cosmic::Application for Window {
         if self.offline && message.needs_network() {
             self.seek_drag = None;
             return self.notify(fl!("offline"));
+        }
+        if matches!(message, Message::TogglePopup | Message::OpenSettings) {
+            let now = Instant::now();
+            if self
+                .popup_toggled
+                .is_some_and(|at| now.duration_since(at) < POPUP_TOGGLE_GAP)
+            {
+                return Task::none();
+            }
+            self.popup_toggled = Some(now);
         }
         match message {
             Message::TogglePopup => {
@@ -485,33 +505,15 @@ impl cosmic::Application for Window {
                     return self.refresh_player();
                 }
             }
-            Message::PlayerLoaded(result) => match *result {
-                Ok(player) => {
-                    let back_online = std::mem::take(&mut self.offline);
-                    let applied = self.apply_player(player);
-                    if !back_online {
-                        return applied;
-                    }
-                    eprintln!("Spotify is reachable again");
-                    self.ensure_receiver();
-                    self.library.retry_failed();
-                    return Task::batch([applied, self.ensure_library()]);
+            Message::PlayerLoaded(result) => {
+                let stale = self.player_fetch == PlayerFetch::Stale;
+                self.player_fetch = PlayerFetch::Idle;
+                let loaded = self.player_loaded(*result);
+                if stale {
+                    return Task::batch([loaded, self.refresh_player()]);
                 }
-                Err(error @ spotify::Error::Network(_)) => {
-                    if !self.offline {
-                        eprintln!("player poll failed, treating as offline: {error}");
-                    }
-                    self.offline = true;
-                    self.playback_held = None;
-                }
-                // A poll that hiccups keeps what is on screen; the next one retries.
-                Err(error @ (spotify::Error::Server(_) | spotify::Error::RateLimited { .. }))
-                    if self.loaded =>
-                {
-                    eprintln!("player poll failed: {error}");
-                }
-                Err(error) => self.handle_api_error(&error),
-            },
+                return loaded;
+            }
             Message::SavedLoaded(uri, result) => {
                 if uri == self.saved_uri {
                     self.saved = self.kept_saved(result.ok());
@@ -623,7 +625,6 @@ impl cosmic::Application for Window {
                 let restored = self.volume_before_mute.take().unwrap_or(50);
                 return self.set_volume(restored);
             }
-            Message::Scroll(delta) => return self.scroll_volume(delta),
             Message::CommandDone(result) => {
                 if let Err(error) = &result {
                     // The optimistic icon was a guess. Let the next poll show
@@ -1125,17 +1126,56 @@ impl Window {
         };
     }
 
-    pub(crate) fn refresh_player(&self) -> Task<Action<Message>> {
+    pub(crate) fn refresh_player(&mut self) -> Task<Action<Message>> {
         let Ok(spotify) = &self.spotify else {
             return Task::none();
         };
         if !matches!(self.session, Session::Connected(_)) {
             return Task::none();
         }
+        if self.player_fetch != PlayerFetch::Idle {
+            self.player_fetch = PlayerFetch::Stale;
+            return Task::none();
+        }
+        self.player_fetch = PlayerFetch::Pending;
         let spotify = spotify.clone();
         Task::perform(async move { spotify.player().await }, |result| {
             Action::App(Message::PlayerLoaded(Box::new(result)))
         })
+    }
+
+    fn player_loaded(
+        &mut self,
+        result: Result<Option<PlayerState>, spotify::Error>,
+    ) -> Task<Action<Message>> {
+        match result {
+            Ok(player) => {
+                let back_online = std::mem::take(&mut self.offline);
+                let applied = self.apply_player(player);
+                if !back_online {
+                    return applied;
+                }
+                eprintln!("Spotify is reachable again");
+                self.ensure_receiver();
+                self.library.retry_failed();
+                return Task::batch([applied, self.ensure_library()]);
+            }
+            Err(error @ spotify::Error::Network(_)) => {
+                if !self.offline {
+                    eprintln!("player poll failed, treating as offline: {error}");
+                }
+                self.offline = true;
+                self.playback_held = None;
+            }
+            // A poll that hiccups keeps what is on screen; the next one retries.
+            Err(error @ (spotify::Error::Server(_) | spotify::Error::RateLimited { .. }))
+                if self.loaded =>
+            {
+                eprintln!("player poll failed: {error}");
+            }
+            Err(error) => self.handle_api_error(&error),
+        }
+        Task::none()
     }
 
     fn apply_player(&mut self, mut player: Option<PlayerState>) -> Task<Action<Message>> {
@@ -1315,24 +1355,6 @@ impl Window {
             VOLUME_DEBOUNCE,
             Message::VolumeCommit(self.volume_generation),
         )
-    }
-
-    fn scroll_volume(&mut self, delta: ScrollDelta) -> Task<Action<Message>> {
-        let Some(volume) = self.volume() else {
-            return Task::none();
-        };
-        self.scroll_notches += match delta {
-            ScrollDelta::Lines { y, .. } => y,
-            ScrollDelta::Pixels { y, .. } => y / PIXELS_PER_NOTCH,
-        };
-        #[allow(clippy::cast_possible_truncation)]
-        let notches = self.scroll_notches.trunc() as i16;
-        if notches == 0 {
-            return Task::none();
-        }
-        self.scroll_notches -= f32::from(notches);
-        let target = (i16::from(volume) + notches * VOLUME_STEP).clamp(0, 100);
-        self.set_volume(u8::try_from(target).unwrap_or(0))
     }
 
     pub(crate) fn handle_api_error(&mut self, error: &spotify::Error) {

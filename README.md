@@ -27,7 +27,7 @@ flatpak install --user cosmic io.github.gbazan92.SpotyPop
 > [latest release](https://github.com/gbazan92/spotypop/releases/latest):
 >
 > ```sh
-> flatpak install --user SpotyPop-0.2.0.flatpak
+> flatpak install --user SpotyPop-0.2.1.flatpak
 > ```
 
 Then add **SpotyPop** to the panel from COSMIC Settings → Desktop → Panel → Applets.
