@@ -18,11 +18,11 @@ use cosmic::surface::action::{LiveSettings, app_popup, destroy_popup};
 use cosmic::{Action, Element, Task};
 
 use crate::art::{self, Artwork};
-use crate::browse::{Browse, Library};
+use crate::browse::{Browse, Library, Load};
 use crate::config::{self, AppConfig, PanelLook};
 use crate::fl;
 use crate::instance::Slot;
-use crate::spotify::{self, Item, PlayerState, Repeat, Session, Spotify, Store, User};
+use crate::spotify::{self, EntryKind, Item, PlayerState, Repeat, Session, Spotify, Store, User};
 use crate::{browser, player, ui};
 
 pub const APP_ID: &str = "io.github.gbazan92.SpotyPop";
@@ -49,6 +49,12 @@ const ENDED_SLACK_MS: u64 = 1_500;
 /// Creating and destroying popups faster than this can hand the renderer a
 /// surface whose size changed under it, which panics inside libcosmic.
 const POPUP_TOGGLE_GAP: Duration = Duration::from_millis(300);
+/// The panel moves the button a moment after the button changes size.
+const PANEL_SETTLE: Duration = Duration::from_millis(80);
+/// A popup created without a size starts at 1×1 and is grown right away, and
+/// a frame drawn during that jump panics inside libcosmic's software renderer.
+/// It is created at the height it had last time instead, or this at first.
+const DEFAULT_POPUP_HEIGHT: u32 = 600;
 
 /// Marks the activation-token request for the receiver's authorization; URLs
 /// always carry a scheme, so it cannot be mistaken for one.
@@ -84,9 +90,8 @@ pub struct Window {
     pub(crate) core: Core,
     popup: Option<Id>,
     popup_toggled: Option<Instant>,
+    popup_height: u32,
     player_fetch: PlayerFetch,
-    /// Last size of the panel button, so the popup can be anchored to it.
-    panel_size: Option<(u32, u32)>,
     pub(crate) view: View,
     config_handler: Option<Config>,
     pub(crate) config: AppConfig,
@@ -148,8 +153,8 @@ pub enum Message {
     ApplyLibraryScroll(f32),
     SetShowTrack(bool),
     SetPanelLook(PanelLook),
-    PanelResized(Id, cosmic::iced::Size),
     RealignPopup,
+    PopupResized(Id, cosmic::iced::Size),
     Poll,
     Tick,
     CheckSlot,
@@ -293,8 +298,8 @@ impl cosmic::Application for Window {
             core,
             popup: None,
             popup_toggled: None,
+            popup_height: DEFAULT_POPUP_HEIGHT,
             player_fetch: PlayerFetch::Idle,
-            panel_size: None,
             view: View::Player,
             config_handler,
             client_id_draft: config.client_id.clone(),
@@ -339,8 +344,54 @@ impl cosmic::Application for Window {
         Some(Message::PopupClosed(id))
     }
 
-    #[allow(clippy::too_many_lines)]
     fn update(&mut self, message: Message) -> Task<Action<Self::Message>> {
+        let button = ui::panel_button_size(self);
+        let task = self.handle(message);
+        if self.popup.is_some() && ui::panel_button_size(self) != button {
+            return Task::batch([task, delayed(PANEL_SETTLE, Message::RealignPopup)]);
+        }
+        task
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subscriptions = vec![
+            self.core.watch_config::<AppConfig>(APP_ID).map(|update| {
+                for error in update.errors {
+                    eprintln!("config watch error: {error}");
+                }
+                Message::ConfigChanged(update.config)
+            }),
+            activation_token_subscription(0).map(Message::Token),
+            cosmic::iced::window::resize_events().map(|(id, size)| Message::PopupResized(id, size)),
+        ];
+        if self.slot.is_some() {
+            subscriptions.push(time::every(SLOT_CHECK).map(|_| Message::CheckSlot));
+        }
+        if matches!(self.session, Session::Connected(_)) {
+            subscriptions.push(time::every(self.poll_interval()).map(|_| Message::Poll));
+            if self.popup.is_some() && self.is_playing() {
+                subscriptions.push(time::every(Duration::from_secs(1)).map(|_| Message::Tick));
+            }
+        }
+        Subscription::batch(subscriptions)
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        ui::panel(self)
+    }
+
+    fn view_window(&self, _id: Id) -> Element<'_, Message> {
+        ui::popup(self)
+    }
+
+    fn style(&self) -> Option<cosmic::iced::theme::Style> {
+        Some(cosmic::applet::style())
+    }
+}
+
+impl Window {
+    #[allow(clippy::too_many_lines)]
+    fn handle(&mut self, message: Message) -> Task<Action<Message>> {
         if self.offline && message.needs_network() {
             self.seek_drag = None;
             return self.notify(fl!("offline"));
@@ -472,19 +523,13 @@ impl cosmic::Application for Window {
             Message::SetPanelLook(look) => {
                 self.write_config(|config, handler| config.set_panel_look(handler, look));
             }
-            Message::PanelResized(id, size) => {
-                if self.core.main_window_id() != Some(id) {
-                    return Task::none();
-                }
-                let next = (px(size.width), px(size.height));
-                if next.0 == 0 || next.1 == 0 || self.panel_size == Some(next) {
-                    return Task::none();
-                }
-                self.panel_size = Some(next);
-                // The panel moves the button a moment after the resize.
-                return delayed(Duration::from_millis(80), Message::RealignPopup);
-            }
             Message::RealignPopup => return self.realign_popup(),
+            Message::PopupResized(id, size) => {
+                let height = px(size.height);
+                if self.popup == Some(id) && height > 0 {
+                    self.popup_height = height;
+                }
+            }
             Message::Poll => {
                 self.ensure_receiver();
                 return Task::batch([self.refresh_player(), self.check_devices(false)]);
@@ -684,43 +729,6 @@ impl cosmic::Application for Window {
         Task::none()
     }
 
-    fn subscription(&self) -> Subscription<Message> {
-        let mut subscriptions = vec![
-            self.core.watch_config::<AppConfig>(APP_ID).map(|update| {
-                for error in update.errors {
-                    eprintln!("config watch error: {error}");
-                }
-                Message::ConfigChanged(update.config)
-            }),
-            activation_token_subscription(0).map(Message::Token),
-            cosmic::iced::window::resize_events().map(|(id, size)| Message::PanelResized(id, size)),
-        ];
-        if self.slot.is_some() {
-            subscriptions.push(time::every(SLOT_CHECK).map(|_| Message::CheckSlot));
-        }
-        if matches!(self.session, Session::Connected(_)) {
-            subscriptions.push(time::every(self.poll_interval()).map(|_| Message::Poll));
-            if self.popup.is_some() && self.is_playing() {
-                subscriptions.push(time::every(Duration::from_secs(1)).map(|_| Message::Tick));
-            }
-        }
-        Subscription::batch(subscriptions)
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        ui::panel(self)
-    }
-
-    fn view_window(&self, _id: Id) -> Element<'_, Message> {
-        ui::popup(self)
-    }
-
-    fn style(&self) -> Option<cosmic::iced::theme::Style> {
-        Some(cosmic::applet::style())
-    }
-}
-
-impl Window {
     pub(crate) fn client(&self) -> Option<Spotify> {
         self.spotify.as_ref().ok().cloned()
     }
@@ -1043,23 +1051,24 @@ impl Window {
 
     /// Play when nothing is playing. Once an album or the queue has run out
     /// Spotify has nothing to resume, so the last track starts again instead.
+    /// The same goes when no device is active at all: handing Spotify's stale
+    /// session to the receiver can leave it playing in a state Spotify never
+    /// registers, so the app would see nothing playing.
     fn resume(&self) -> Task<Action<Message>> {
         let ended = match (&self.player, self.item()) {
-            (Some(_), None) => self.last_item.clone(),
+            (_, None) => self.latest_played(),
             (_, Some(item))
                 if item.duration_ms > 0
                     && self.progress_ms() + ENDED_SLACK_MS >= item.duration_ms =>
             {
-                Some(item.clone())
+                Some((item.uri.clone(), item.parent_uri.clone()))
             }
             _ => None,
         };
         let fallback = self.shown_item().cloned();
         self.command(move |spotify| async move {
-            if let Some(item) = ended {
-                return spotify
-                    .play_item(&item.uri, item.parent_uri.as_deref())
-                    .await;
+            if let Some((uri, parent)) = ended {
+                return spotify.play_item(&uri, parent.as_deref()).await;
             }
             let result = spotify.play().await;
             match (&result, fallback) {
@@ -1071,6 +1080,24 @@ impl Window {
                 _ => result,
             }
         })
+    }
+
+    /// The last thing heard and the album or show it belongs to. Play history
+    /// comes first because it also knows what played on other devices.
+    fn latest_played(&self) -> Option<(String, Option<String>)> {
+        let heard = match &self.library.recent {
+            Load::Ready(list) => list.iter().find(|entry| {
+                entry.playable && matches!(entry.kind, EntryKind::Track | EntryKind::Episode)
+            }),
+            _ => None,
+        };
+        heard
+            .map(|entry| (entry.uri.clone(), entry.parent_uri.clone()))
+            .or_else(|| {
+                self.last_item
+                    .as_ref()
+                    .map(|item| (item.uri.clone(), item.parent_uri.clone()))
+            })
     }
 
     fn enable_playback(&mut self) -> Task<Action<Message>> {
@@ -1391,6 +1418,7 @@ impl Window {
             .max_width(ui::POPUP_WIDTH)
             .min_height(120.0)
             .max_height(1000.0);
+        settings.positioner.size = Some((px(ui::POPUP_WIDTH), self.popup_height));
         match self.core.applet.anchor {
             PanelAnchor::Top => {
                 settings.positioner.anchor = Anchor::BottomLeft;
@@ -1402,10 +1430,9 @@ impl Window {
             }
             PanelAnchor::Left | PanelAnchor::Right => {}
         }
-        if let Some((width, height)) = self.panel_size {
-            settings.positioner.anchor_rect.width = i32::try_from(width).unwrap_or(i32::MAX);
-            settings.positioner.anchor_rect.height = i32::try_from(height).unwrap_or(i32::MAX);
-        }
+        let (width, height) = ui::panel_button_size(self);
+        settings.positioner.anchor_rect.width = i32::try_from(px(width)).unwrap_or(i32::MAX);
+        settings.positioner.anchor_rect.height = i32::try_from(px(height)).unwrap_or(i32::MAX);
         settings
     }
 

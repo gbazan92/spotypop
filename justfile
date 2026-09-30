@@ -1,6 +1,7 @@
 name := 'spotypop'
 player := 'spotypop-player'
 appid := 'io.github.gbazan92.SpotyPop'
+version := `sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1`
 
 bin-dir := env('HOME') / '.local/bin'
 desktop-dst := env('HOME') / '.local/share/applications' / appid + '.desktop'
@@ -46,10 +47,11 @@ flatpak-sources:
     flatpak run --filesystem="$tools" --filesystem="$PWD" --share=network --command=sh org.freedesktop.Sdk//25.08 -c \
         "python3 -m pip install -q --target '$tools/py' aiohttp tomlkit PyYAML && PYTHONPATH='$tools/py' python3 '$tools/flatpak-cargo-generator.py' Cargo.lock -o cargo-sources.json"
 
-# Builds the Flatpak offline, the way the COSMIC Flatpak repository does, and bundles it
+# Builds the Flatpak offline, the way the COSMIC Flatpak repository does, and
+# bundles it named after the release tag, e.g. SpotyPop-v0.2.2.flatpak
 flatpak:
     flatpak run org.flatpak.Builder --user --sandbox --force-clean --install-deps-from=flathub --repo=flatpak-repo flatpak-build {{appid}}.yml
-    flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo flatpak-repo {{name}}.flatpak {{appid}}
+    flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo flatpak-repo SpotyPop-v{{version}}.flatpak {{appid}}
 
 flatpak-lint:
     flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest {{appid}}.yml || true

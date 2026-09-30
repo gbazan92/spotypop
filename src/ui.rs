@@ -19,8 +19,11 @@ use crate::spotify::{Device, Entry, EntryKind, Item, ItemKind, Repeat, Session};
 use crate::window::{Message, Playback, View, Window};
 
 pub const POPUP_WIDTH: f32 = 400.0;
+/// Width of what the bar shows next to the logo while a track is up, whatever
+/// the look: the scopes fill it, and the cover plus its title add up to it.
 /// Longer titles scroll instead of widening the panel.
-const PANEL_LABEL_WIDTH: f32 = 180.0;
+const PANEL_CHIP_WIDTH: f32 = 180.0;
+const CHIP_SPACING: f32 = 8.0;
 pub const HERO_SIZE: f32 = 96.0;
 const HERO_RADIUS: f32 = 10.0;
 const VOLUME_SLIDER_WIDTH: f32 = 110.0;
@@ -93,16 +96,46 @@ fn mask(value: &str) -> String {
 
 // ---------------------------------------------------------------- panel
 
-pub fn panel(state: &Window) -> Element<'_, Message> {
+fn button_padding(state: &Window) -> (u16, u16) {
     let applet = &state.core.applet;
-    let horizontal = applet.is_horizontal();
-    let (icon_size, _) = applet.suggested_size(true);
     let (major, minor) = applet.suggested_padding(true);
-    let (pad_x, pad_y) = if horizontal {
+    if applet.is_horizontal() {
         (major, minor)
     } else {
         (minor, major)
+    }
+}
+
+/// Spotify drops the item after a pause or a hiccup. The bar keeps the last
+/// one so it does not collapse to the cover and grow back a moment later.
+fn shows_chip(state: &Window) -> bool {
+    state.core.applet.is_horizontal()
+        && matches!(state.session, Session::Connected(_))
+        && state.config.show_track
+        && state.shown_item().is_some()
+}
+
+/// The size [`panel`] gives the button. The panel does not report the
+/// applet's size when it follows its content, so the popup is anchored to this.
+pub fn panel_button_size(state: &Window) -> (f32, f32) {
+    let (icon_size, _) = state.core.applet.suggested_size(true);
+    let (pad_x, pad_y) = button_padding(state);
+    let icon = f32::from(icon_size);
+    let content = if shows_chip(state) {
+        PANEL_CHIP_WIDTH
+    } else {
+        icon
     };
+    (
+        content + 2.0 * f32::from(pad_x),
+        icon + 2.0 * f32::from(pad_y),
+    )
+}
+
+pub fn panel(state: &Window) -> Element<'_, Message> {
+    let applet = &state.core.applet;
+    let (icon_size, _) = applet.suggested_size(true);
+    let (pad_x, pad_y) = button_padding(state);
 
     let connected = matches!(state.session, Session::Connected(_));
     // Same box as the logo, so switching between them never resizes the panel.
@@ -130,18 +163,11 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         None => logo(icon_size).into(),
     };
 
-    // Spotify drops the item after a pause or a hiccup. The bar keeps the last
-    // one so it does not collapse to the cover and grow back a moment later.
-    let content =
-        if horizontal && connected && state.config.show_track && state.shown_item().is_some() {
-            playing_chip(state, cover_size, cover)
-        } else {
-            Row::new()
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .push(cover)
-                .into()
-        };
+    let content = if shows_chip(state) {
+        playing_chip(state, cover_size, cover)
+    } else {
+        cover
+    };
 
     let content = container(content)
         .height(cover_size)
@@ -153,8 +179,7 @@ pub fn panel(state: &Window) -> Element<'_, Message> {
         .class(theme::Button::AppletIcon)
         .on_press(Message::TogglePopup);
 
-    let area = mouse_area(button)
-        .on_right_press(Message::OpenSettings);
+    let area = mouse_area(button).on_right_press(Message::OpenSettings);
 
     applet.autosize_window(area).into()
 }
@@ -173,14 +198,16 @@ fn track_label(state: &Window) -> String {
 
 fn scrolling_label(state: &Window, cover_size: f32) -> Element<'_, Message> {
     let applet = &state.core.applet;
+    let width = (PANEL_CHIP_WIDTH - cover_size - CHIP_SPACING).max(0.0);
     // The preset line height is taller than the icon, which stretches the bar.
-    marquee(
+    container(marquee(
         applet
             .text(track_label(state))
             .wrapping(Wrapping::None)
             .line_height(LineHeight::Absolute(cover_size.into())),
-        PANEL_LABEL_WIDTH,
-    )
+        width,
+    ))
+    .width(Length::Fixed(width))
     .into()
 }
 
@@ -192,7 +219,7 @@ fn playing_chip<'a>(
     let kind = match state.config.panel_look {
         PanelLook::Cover => {
             return Row::new()
-                .spacing(8)
+                .spacing(CHIP_SPACING)
                 .align_y(Alignment::Center)
                 .push(cover)
                 .push(scrolling_label(state, cover_size))
@@ -202,7 +229,7 @@ fn playing_chip<'a>(
         PanelLook::Wave => look::ScopeKind::Wave,
         PanelLook::Fill => look::ScopeKind::Fill,
     };
-    scope(kind, PANEL_LABEL_WIDTH, cover_size, state.is_playing())
+    scope(kind, PANEL_CHIP_WIDTH, cover_size, state.is_playing())
 }
 
 // ---------------------------------------------------------------- popup
@@ -858,10 +885,7 @@ fn round_card(theme: &cosmic::Theme, radius: f32) -> cosmic::iced::widget::conta
     }
 }
 
-fn entry_row<'a>(
-    state: &'a Window,
-    entry: &'a Entry,
-) -> Element<'a, Message> {
+fn entry_row<'a>(state: &'a Window, entry: &'a Entry) -> Element<'a, Message> {
     let round = entry.kind == EntryKind::Artist;
     let thumb: Element<'a, Message> = match entry
         .art_url

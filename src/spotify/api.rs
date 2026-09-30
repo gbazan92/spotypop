@@ -21,7 +21,8 @@ const LIST_LIMIT: usize = 200;
 const PAGE_SIZE: usize = 50;
 const MAX_PLAY_URIS: usize = 100;
 const LOCAL_DEVICE_POLLS: u32 = 8;
-const LOCAL_DEVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);/// Refresh a little early so a request never leaves with a token about to expire.
+const LOCAL_DEVICE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Refresh a little early so a request never leaves with a token about to expire.
 const EXPIRY_MARGIN_SECS: u64 = 45;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
