@@ -6005,7 +6005,7 @@ dependencies = [
 
 [[package]]
 name = "spotypop"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.23.1",
  "i18n-embed",
@@ -6028,7 +6028,7 @@ dependencies = [
 
 [[package]]
 name = "spotypop-player"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "env_logger",
  "futures-core",

@@ -3,7 +3,7 @@ members = ["player"]
 
 [package]
 name = "spotypop"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "A Spotify mini player for the COSMIC desktop panel"
